@@ -1,0 +1,1322 @@
+#!/usr/bin/env python3
+"""
+gui.py
+======
+GUI Tkinter untuk pengujian deteksi sampah: YOLO-only vs YOLO+SAHI
+Model : Kaggle RFT (8 kelas) — hasil training 100 epoch
+
+Fitur:
+- Upload gambar dari file dialog
+- Mode YOLO-only: deteksi langsung pada gambar penuh
+- Mode YOLO+SAHI: visualisasi fragmentasi (grid slice) + deteksi per patch
+- Tampilkan bounding box + label kelas + confidence
+- Tampilkan statistik: jumlah deteksi, latency (ms), FPS
+
+Penggunaan:
+    python src/gui.py
+    python src/gui.py --model weights/best.pt
+"""
+
+import os
+import sys
+import time
+import math
+import threading
+import argparse
+from pathlib import Path
+from copy import deepcopy
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+os.environ["POLARS_SKIP_CPU_CHECK"] = "1"
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+import numpy as np
+import cv2
+
+# ── Konstanta ─────────────────────────────────────────────────────────────────
+# Kelas sesuai dataset Kaggle RFT (8 kelas)
+CLASS_NAMES = [
+    "bottle",            # 0
+    "grass",             # 1
+    "branch",            # 2
+    "milk-box",          # 3
+    "plastic-bag",       # 4
+    "plastic-garbage",   # 5
+    "ball",              # 6
+    "leaf",              # 7
+]
+
+# Warna per kelas (RGB untuk PIL)
+CLASS_COLORS_RGB = {
+    0: (255, 128,   0),  # bottle          — orange
+    1: (0,   200, 100),  # grass           — green
+    2: (139,  90,  43),  # branch          — brown
+    3: (0,   120, 255),  # milk-box        — blue
+    4: (220,   0, 150),  # plastic-bag     — pink
+    5: (140,   0, 255),  # plastic-garbage — purple
+    6: (0,   220, 220),  # ball            — cyan
+    7: (180, 200,  60),  # leaf            — yellow-green
+}
+
+CONF_THRESHOLD = 0.15    # diturunkan dari 0.25 agar lebih banyak deteksi
+SLICE_SIZE     = 640
+OVERLAP_RATIO  = 0.2
+
+# ── Tema ──────────────────────────────────────────────────────────────────────
+BG_DARK   = "#1a1a2e"
+BG_MID    = "#16213e"
+BG_CARD   = "#0f3460"
+ACCENT    = "#e94560"
+ACCENT2   = "#533483"
+TEXT_MAIN = "#eaeaea"
+TEXT_SUB  = "#a0a0b0"
+SUCCESS   = "#4caf50"
+WARNING   = "#ff9800"
+
+# ── Model Loader ──────────────────────────────────────────────────────────────
+
+def load_yolo_model(model_path: str):
+    from ultralytics import YOLO
+    return YOLO(model_path)
+
+
+# ── Detection Functions ───────────────────────────────────────────────────────
+
+def run_yolo_full(model, img_bgr: np.ndarray, device="cpu", conf=0.15):
+    """YOLO inference pada gambar penuh. Returns (boxes, scores, class_ids, ms)."""
+    import torch
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        results = model(
+            img_bgr,
+            conf=conf,
+            iou=0.5,
+            device=device,
+            verbose=False,
+            imgsz=SLICE_SIZE,
+        )
+    t1 = time.perf_counter()
+    ms = (t1 - t0) * 1000
+
+    r = results[0].boxes
+    if r is None or len(r) == 0:
+        return np.empty((0, 4)), np.empty(0), np.empty(0, int), ms
+
+    boxes    = r.xyxy.cpu().numpy()
+    scores   = r.conf.cpu().numpy()
+    cls_ids  = r.cls.cpu().numpy().astype(int)
+    return boxes, scores, cls_ids, ms
+
+
+def generate_slices(H, W, size=640, overlap=0.2):
+    """Hasilkan daftar koordinat patch (x1,y1,x2,y2)."""
+    stride = int(size * (1 - overlap))
+    slices = []
+    y = 0
+    while True:
+        x = 0
+        while True:
+            x1 = x
+            y1 = y
+            x2 = min(x + size, W)
+            y2 = min(y + size, H)
+            slices.append((x1, y1, x2, y2))
+            if x2 == W:
+                break
+            x += stride
+        if y2 == H:
+            break
+        y += stride
+    return slices
+
+
+def run_yolo_on_patch(model, patch_bgr, device="cpu", conf=0.15):
+    """Inference pada satu patch. Returns (boxes, scores, class_ids)."""
+    import torch
+    with torch.no_grad():
+        results = model(
+            patch_bgr,
+            conf=conf,
+            iou=0.5,
+            device=device,
+            verbose=False,
+            imgsz=SLICE_SIZE,
+        )
+    r = results[0].boxes
+    if r is None or len(r) == 0:
+        return np.empty((0, 4)), np.empty(0), np.empty(0, int)
+    return (
+        r.xyxy.cpu().numpy(),
+        r.conf.cpu().numpy(),
+        r.cls.cpu().numpy().astype(int),
+    )
+
+
+def multiclass_nms_numpy(boxes, scores, cls_ids, iou_thr=0.5):
+    """Simple multi-class NMS tanpa torch dependency."""
+    if len(boxes) == 0:
+        return boxes, scores, cls_ids
+
+    import torchvision.ops as ops
+    import torch
+    boxes_t  = torch.from_numpy(boxes.astype(np.float32))
+    scores_t = torch.from_numpy(scores.astype(np.float32))
+    cls_t    = torch.from_numpy(cls_ids.astype(np.float32))
+
+    max_coord = boxes_t.max() + 1
+    offsets   = cls_t * max_coord
+    boxes_off = boxes_t + offsets[:, None]
+    keep      = ops.nms(boxes_off, scores_t, iou_thr).numpy()
+    return boxes[keep], scores[keep], cls_ids[keep]
+
+
+# ── Drawing ───────────────────────────────────────────────────────────────────
+
+def draw_boxes_pil(pil_img: Image.Image, boxes, scores, cls_ids,
+                   alpha_overlay=None) -> Image.Image:
+    """Gambar bounding box + label pada PIL Image."""
+    draw = ImageDraw.Draw(pil_img, "RGBA")
+    try:
+        font_label = ImageFont.truetype("arial.ttf", 14)
+        font_small = ImageFont.truetype("arial.ttf", 12)
+    except Exception:
+        font_label = ImageFont.load_default()
+        font_small = font_label
+
+    for i in range(len(boxes)):
+        x1, y1, x2, y2 = boxes[i]
+        cid   = int(cls_ids[i]) if i < len(cls_ids) else 6
+        score = float(scores[i]) if i < len(scores) else 0.0
+        color = CLASS_COLORS_RGB.get(cid, (150, 150, 150))
+        color_a = (*color, 200)
+
+        # Box outline
+        for t in range(2):
+            draw.rectangle([x1-t, y1-t, x2+t, y2+t], outline=(*color, 255))
+
+        # Label background
+        label = f"{CLASS_NAMES[cid] if cid < len(CLASS_NAMES) else 'obj'} {score:.2f}"
+        bbox = draw.textbbox((x1, y1 - 18), label, font=font_label)
+        draw.rectangle(bbox, fill=(*color, 230))
+        draw.text((x1, y1 - 18), label, fill=(255, 255, 255, 255), font=font_label)
+
+    return pil_img
+
+
+def draw_slice_grid(pil_img: Image.Image, slices, active_idx=-1,
+                    done_indices=None) -> Image.Image:
+    """
+    Gambar grid slice pada gambar.
+
+    active_idx  : slice yang sedang diproses (merah)
+    done_indices: set slice yang sudah selesai (hijau transparan)
+    """
+    done_indices = done_indices or set()
+    overlay = Image.new("RGBA", pil_img.size, (0, 0, 0, 0))
+    draw    = ImageDraw.Draw(overlay)
+
+    for i, (x1, y1, x2, y2) in enumerate(slices):
+        if i == active_idx:
+            fill    = (255, 80, 80, 80)
+            outline = (255, 0, 0, 255)
+            width   = 3
+        elif i in done_indices:
+            fill    = (80, 200, 80, 40)
+            outline = (80, 200, 80, 180)
+            width   = 1
+        else:
+            fill    = (255, 255, 255, 15)
+            outline = (200, 200, 255, 120)
+            width   = 1
+
+        draw.rectangle([x1, y1, x2-1, y2-1], fill=fill, outline=outline, width=width)
+
+        # Nomor slice
+        try:
+            font = ImageFont.truetype("arial.ttf", 12)
+        except Exception:
+            font = ImageFont.load_default()
+        draw.text((x1 + 4, y1 + 4), f"#{i+1}", fill=(255, 255, 255, 200), font=font)
+
+    return Image.alpha_composite(pil_img.convert("RGBA"), overlay).convert("RGB")
+
+
+# ── GUI App ───────────────────────────────────────────────────────────────────
+
+class TrashDetectionApp:
+    def __init__(self, root: tk.Tk, model_path: str = "weights/best.pt"):
+        self.root       = root
+        self.model_path = model_path
+        self.model      = None
+        self.img_bgr    = None
+        self.img_path   = None
+        self._running   = False
+
+        # ── Video state ──────────────────────────────────────────────
+        self._video_cap     = None   # cv2.VideoCapture
+        self._video_running = False
+        self._video_paused  = False
+        self._video_path    = None
+        self._tk_img_video  = None   # keep PhotoImage reference
+
+        self._setup_window()
+        self._build_ui()
+        self._load_model_async()
+
+    # ── Window Setup ──────────────────────────────────────────────────────
+
+    def _setup_window(self):
+        self.root.title("🗑️  Trash Detection: YOLO vs YOLO+SAHI")
+        self.root.geometry("1280x780")
+        self.root.minsize(900, 600)
+        self.root.configure(bg=BG_DARK)
+
+        # Ttk style
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TFrame",      background=BG_DARK)
+        style.configure("Card.TFrame", background=BG_MID)
+        style.configure(
+            "Accent.TButton",
+            background=ACCENT, foreground="white",
+            font=("Segoe UI", 10, "bold"), padding=8,
+        )
+        style.map("Accent.TButton",
+                  background=[("active", "#c73652"), ("disabled", "#555")])
+        style.configure(
+            "Mode.TRadiobutton",
+            background=BG_MID, foreground=TEXT_MAIN,
+            font=("Segoe UI", 10), indicatorcolor=ACCENT,
+        )
+        style.configure(
+            "TLabel",
+            background=BG_DARK, foreground=TEXT_MAIN,
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "Title.TLabel",
+            background=BG_DARK, foreground=TEXT_MAIN,
+            font=("Segoe UI", 14, "bold"),
+        )
+        style.configure(
+            "Sub.TLabel",
+            background=BG_DARK, foreground=TEXT_SUB,
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "Stat.TLabel",
+            background=BG_MID, foreground=TEXT_MAIN,
+            font=("Consolas", 10),
+        )
+
+    # ── UI Builder ────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # ── Top bar ───────────────────────────────�    def _build_left_panel(self, parent):
+        """
+        Panel kiri dengan scrollbar agar semua kontrol selalu bisa diakses
+        meski kontennya panjang.
+        """
+        # ── Scrollable wrapper ────────────────────────────────────────────────
+        wrapper  = tk.Frame(parent, bg=BG_MID)
+        wrapper.pack(fill="both", expand=True)
+
+        sb = ttk.Scrollbar(wrapper, orient="vertical")
+        sb.pack(side="right", fill="y")
+
+        canvas_scroll = tk.Canvas(wrapper, bg=BG_MID, highlightthickness=0,
+                                  yscrollcommand=sb.set)
+        canvas_scroll.pack(side="left", fill="both", expand=True)
+        sb.config(command=canvas_scroll.yview)
+
+        inner = tk.Frame(canvas_scroll, bg=BG_MID)
+        inner_window = canvas_scroll.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_configure(e):
+            canvas_scroll.configure(scrollregion=canvas_scroll.bbox("all"))
+        def _on_canvas_resize(e):
+            canvas_scroll.itemconfig(inner_window, width=e.width)
+        inner.bind("<Configure>", _on_configure)
+        canvas_scroll.bind("<Configure>", _on_canvas_resize)
+
+        # Scroll dengan mouse wheel
+        def _on_wheel(e):
+            canvas_scroll.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas_scroll.bind_all("<MouseWheel>", _on_wheel)
+
+        p = inner   # shorthand — semua widget ke `p`
+        pad = {"padx": 12, "pady": 4}
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SEKSI 1 — GAMBAR
+        # ══════════════════════════════════════════════════════════════════════
+        self._section_header(p, "📁  GAMBAR")
+
+        ttk.Button(p, text="Upload Gambar", style="Accent.TButton",
+                   command=self._upload_image).pack(fill="x", padx=12, pady=(4, 2))
+
+        self._filename_var = tk.StringVar(value="Belum ada gambar")
+        tk.Label(p, textvariable=self._filename_var, bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8), wraplength=210).pack(anchor="w", padx=12)
+
+        # Mode deteksi gambar
+        self._section_subheader(p, "⚙️  Mode Deteksi Gambar")
+        self._mode_var = tk.StringVar(value="yolo")
+        for val, lbl, desc in [
+            ("yolo", "🎯 YOLO-only",   "Deteksi gambar penuh"),
+            ("sahi", "🔲 YOLO + SAHI", "Fragmentasi + deteksi"),
+        ]:
+            f = tk.Frame(p, bg=BG_MID)
+            f.pack(fill="x", padx=8, pady=1)
+            tk.Radiobutton(
+                f, text=lbl, variable=self._mode_var, value=val,
+                bg=BG_MID, fg=TEXT_MAIN, selectcolor=BG_CARD,
+                activebackground=BG_MID, activeforeground=ACCENT,
+                font=("Segoe UI", 9, "bold"), indicatoron=True,
+            ).pack(anchor="w")
+            tk.Label(f, text=desc, bg=BG_MID, fg=TEXT_SUB,
+                     font=("Segoe UI", 8)).pack(anchor="w", padx=20)
+
+        # Tombol Deteksi
+        self._detect_btn = ttk.Button(
+            p, text="▶  Jalankan Deteksi",
+            style="Accent.TButton",
+            command=self._run_detection,
+            state="disabled",
+        )
+        self._detect_btn.pack(fill="x", padx=12, pady=(6, 2))
+
+        self._progress = ttk.Progressbar(p, mode="indeterminate")
+        self._progress.pack(fill="x", padx=12, pady=(0, 4))
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SEKSI 2 — VIDEO
+        # ══════════════════════════════════════════════════════════════════════
+        self._divider(p)
+        self._section_header(p, "🎥  VIDEO")
+
+        ttk.Button(p, text="Upload Video", style="Accent.TButton",
+                   command=self._upload_video).pack(fill="x", padx=12, pady=(4, 2))
+
+        self._videoname_var = tk.StringVar(value="Belum ada video")
+        tk.Label(p, textvariable=self._videoname_var, bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8), wraplength=210).pack(anchor="w", padx=12)
+
+        # Mode video
+        self._section_subheader(p, "⚙️  Mode Deteksi Video")
+        self._video_mode_var = tk.StringVar(value="yolo")
+        vm_f = tk.Frame(p, bg=BG_MID)
+        vm_f.pack(fill="x", padx=8, pady=2)
+        for val, lbl in [("yolo", "🎯 YOLO-only"), ("sahi", "🔲 YOLO+SAHI")]:
+            tk.Radiobutton(
+                vm_f, text=lbl, variable=self._video_mode_var, value=val,
+                bg=BG_MID, fg=TEXT_MAIN, selectcolor=BG_CARD,
+                activebackground=BG_MID, activeforeground=ACCENT,
+                font=("Segoe UI", 9, "bold"), indicatoron=True,
+                command=self._on_video_mode_change,
+            ).pack(side="left", padx=4)
+
+        self._video_mode_warn = tk.Label(
+            p, text="", bg=BG_MID, fg=WARNING,
+            font=("Segoe UI", 7), wraplength=210)
+        self._video_mode_warn.pack(anchor="w", padx=12)
+
+        # Tombol Play / Stop
+        vctrl = tk.Frame(p, bg=BG_MID)
+        vctrl.pack(fill="x", padx=12, pady=(4, 2))
+
+        self._play_btn = tk.Button(
+            vctrl, text="▶ Play", bg=SUCCESS, fg="white",
+            font=("Segoe UI", 9, "bold"), relief="flat", padx=6, pady=4,
+            command=self._video_play_pause, state="disabled")
+        self._play_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
+
+        self._stop_btn = tk.Button(
+            vctrl, text="■ Stop", bg=ACCENT, fg="white",
+            font=("Segoe UI", 9, "bold"), relief="flat", padx=6, pady=4,
+            command=self._video_stop, state="disabled")
+        self._stop_btn.pack(side="left", expand=True, fill="x")
+
+        self._video_progress_var = tk.StringVar(value="Frame: —")
+        tk.Label(p, textvariable=self._video_progress_var,
+                 bg=BG_MID, fg=TEXT_SUB, font=("Consolas", 8)).pack(anchor="w", padx=12)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SEKSI 3 — PENGATURAN BERSAMA (SAHI + Confidence)
+        # ══════════════════════════════════════════════════════════════════════
+        self._divider(p)
+        self._section_header(p, "🔧  PENGATURAN")
+
+        # SAHI settings
+        self._section_subheader(p, "🔲 SAHI Settings")
+        sf = tk.Frame(p, bg=BG_MID)
+        sf.pack(fill="x", padx=12, pady=2)
+
+        tk.Label(sf, text="Slice size:", bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w")
+        self._slice_var = tk.IntVar(value=640)
+        tk.Spinbox(sf, from_=128, to=1024, increment=64,
+                   textvariable=self._slice_var, width=6,
+                   bg=BG_CARD, fg=TEXT_MAIN, font=("Consolas", 9),
+                   buttonbackground=BG_CARD).grid(row=0, column=1, padx=4)
+
+        tk.Label(sf, text="Overlap:", bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", pady=2)
+        self._overlap_var = tk.DoubleVar(value=0.2)
+        tk.Spinbox(sf, from_=0.0, to=0.5, increment=0.05, format="%.2f",
+                   textvariable=self._overlap_var, width=6,
+                   bg=BG_CARD, fg=TEXT_MAIN, font=("Consolas", 9),
+                   buttonbackground=BG_CARD).grid(row=1, column=1, padx=4)
+
+        # Confidence threshold
+        self._section_subheader(p, "🎚️  Confidence Threshold")
+        cf = tk.Frame(p, bg=BG_MID)
+        cf.pack(fill="x", padx=12, pady=2)
+        self._conf_var = tk.DoubleVar(value=0.15)
+        self._conf_label_var = tk.StringVar(value="0.15")
+
+        def _update_conf_label(v):
+            self._conf_label_var.set(f"{round(float(v), 2):.2f}")
+
+        tk.Scale(cf, from_=0.05, to=0.9, resolution=0.05,
+                 variable=self._conf_var, orient="horizontal",
+                 bg=BG_MID, fg=TEXT_MAIN, troughcolor=BG_CARD,
+                 highlightthickness=0, showvalue=False,
+                 command=_update_conf_label, length=140).pack(side="left")
+        tk.Label(cf, textvariable=self._conf_label_var,
+                 bg=BG_MID, fg=ACCENT, font=("Consolas", 10, "bold"),
+                 width=4).pack(side="left", padx=4)
+        tk.Label(p, text="(turunkan jika kurang deteksi)",
+                 bg=BG_MID, fg=TEXT_SUB, font=("Segoe UI", 7)).pack(anchor="w", padx=12)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SEKSI 4 — HASIL
+        # ══════════════════════════════════════════════════════════════════════
+        self._divider(p)
+        self._section_header(p, "📊  HASIL")
+
+        self._stats_frame = tk.Frame(p, bg=BG_MID)
+        self._stats_frame.pack(fill="x", padx=12, pady=2)
+
+        self._stat_vars = {}
+        for key, label in [
+            ("mode",     "Mode"),
+            ("detected", "Deteksi"),
+            ("latency",  "Latency"),
+            ("fps",      "FPS"),
+            ("patches",  "Patches"),
+        ]:
+            row = tk.Frame(self._stats_frame, bg=BG_MID)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=f"{label}:", bg=BG_MID, fg=TEXT_SUB,
+                     font=("Segoe UI", 8), width=8, anchor="w").pack(side="left")
+            var = tk.StringVar(value="—")
+            self._stat_vars[key] = var
+            tk.Label(row, textvariable=var, bg=BG_MID, fg=TEXT_MAIN,
+                     font=("Consolas", 9)).pack(side="left")
+
+        self._section_subheader(p, "🏷️  Daftar Deteksi")
+
+        det_frame = tk.Frame(p, bg=BG_MID)
+        det_frame.pack(fill="both", expand=True, padx=8, pady=4)
+
+        det_sb = ttk.Scrollbar(det_frame)
+        det_sb.pack(side="right", fill="y")
+
+        self._det_list = tk.Listbox(
+            det_frame, yscrollcommand=det_sb.set,
+            bg=BG_CARD, fg=TEXT_MAIN,
+            font=("Consolas", 8), selectbackground=ACCENT,
+            relief="flat", borderwidth=0, height=6,
+        )
+        self._det_list.pack(fill="both", expand=True)
+        det_sb.config(command=self._det_list.yview)
+
+    # ── Left panel helpers ────────────────────────────────────────────────────
+
+    def _section_header(self, parent, text):
+        """Header section dengan background card dan teks bold."""
+        hdr = tk.Frame(parent, bg=BG_CARD, height=26)
+        hdr.pack(fill="x", padx=0, pady=(6, 0))
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text=text, bg=BG_CARD, fg=TEXT_MAIN,
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=10, pady=4)
+
+    def _section_subheader(self, parent, text):
+        """Sub-header kecil."""
+        tk.Label(parent, text=text, bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12, pady=(6, 2))
+
+    def _divider(self, parent):
+        """Garis pemisah antar seksi."""
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=0, pady=4)          activebackground=BG_MID, activeforeground=ACCENT,
+                font=("Segoe UI", 9, "bold"), indicatoron=True,
+                command=self._on_video_mode_change,
+            ).pack(side="left", padx=6)
+
+        self._video_mode_warn = tk.Label(
+            parent, text="",
+            bg=BG_MID, fg=WARNING,
+            font=("Segoe UI", 7), wraplength=210,
+        )
+        self._video_mode_warn.pack(anchor="w", padx=12)
+
+        # Kontrol video
+        vctrl = tk.Frame(parent, bg=BG_MID)
+        vctrl.pack(fill="x", padx=12, pady=4)
+
+        self._play_btn = tk.Button(
+            vctrl, text="\u25b6 Play",
+            bg=SUCCESS, fg="white", font=("Segoe UI", 9, "bold"),
+            relief="flat", padx=8, pady=4,
+            command=self._video_play_pause,
+            state="disabled",
+        )
+        self._play_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
+
+        self._stop_btn = tk.Button(
+            vctrl, text="\u25a0 Stop",
+            bg=ACCENT, fg="white", font=("Segoe UI", 9, "bold"),
+            relief="flat", padx=8, pady=4,
+            command=self._video_stop,
+            state="disabled",
+        )
+        self._stop_btn.pack(side="left", expand=True, fill="x")
+
+        # Progress video
+        self._video_progress_var = tk.StringVar(value="Frame: \u2014")
+        tk.Label(
+            parent, textvariable=self._video_progress_var,
+            bg=BG_MID, fg=TEXT_SUB, font=("Consolas", 8),
+        ).pack(anchor="w", padx=12)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=8, pady=8)
+
+        # Mode
+        tk.Label(parent, text="⚙️  MODE DETEKSI", bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", **pad)
+
+        self._mode_var = tk.StringVar(value="yolo")
+        for val, lbl, desc in [
+            ("yolo",  "🎯 YOLO-only",   "Deteksi gambar penuh"),
+            ("sahi",  "🔲 YOLO + SAHI", "Fragmentasi + deteksi"),
+        ]:
+            f = tk.Frame(parent, bg=BG_MID)
+            f.pack(fill="x", padx=8, pady=2)
+            rb = tk.Radiobutton(
+                f, text=lbl, variable=self._mode_var, value=val,
+                bg=BG_MID, fg=TEXT_MAIN, selectcolor=BG_CARD,
+                activebackground=BG_MID, activeforeground=ACCENT,
+                font=("Segoe UI", 10, "bold"),
+                indicatoron=True,
+            )
+            rb.pack(anchor="w")
+            tk.Label(f, text=desc, bg=BG_MID, fg=TEXT_SUB,
+                     font=("Segoe UI", 8)).pack(anchor="w", padx=20)
+
+        # SAHI settings
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=8, pady=6)
+        tk.Label(parent, text="🔲 SAHI Settings", bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", **pad)
+
+        sf = tk.Frame(parent, bg=BG_MID)
+        sf.pack(fill="x", padx=12)
+        tk.Label(sf, text="Slice size:", bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w")
+        self._slice_var = tk.IntVar(value=640)
+        tk.Spinbox(sf, from_=128, to=1024, increment=64,
+                   textvariable=self._slice_var, width=6,
+                   bg=BG_CARD, fg=TEXT_MAIN, font=("Consolas", 9),
+                   buttonbackground=BG_CARD,
+                   ).grid(row=0, column=1, padx=4)
+
+        tk.Label(sf, text="Overlap:", bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", pady=2)
+        self._overlap_var = tk.DoubleVar(value=0.2)
+        tk.Spinbox(sf, from_=0.0, to=0.5, increment=0.05,
+                   textvariable=self._overlap_var, width=6, format="%.2f",
+                   bg=BG_CARD, fg=TEXT_MAIN, font=("Consolas", 9),
+                   buttonbackground=BG_CARD,
+                   ).grid(row=1, column=1, padx=4)
+
+        # Confidence threshold slider
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=8, pady=6)
+        tk.Label(parent, text="🎚️  Confidence Threshold", bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", **pad)
+
+        cf = tk.Frame(parent, bg=BG_MID)
+        cf.pack(fill="x", padx=12)
+        self._conf_var = tk.DoubleVar(value=0.15)
+        self._conf_label_var = tk.StringVar(value="0.15")
+        def _update_conf_label(v):
+            val = round(float(v), 2)
+            self._conf_label_var.set(f"{val:.2f}")
+        tk.Scale(
+            cf, from_=0.05, to=0.9, resolution=0.05,
+            variable=self._conf_var, orient="horizontal",
+            bg=BG_MID, fg=TEXT_MAIN, troughcolor=BG_CARD,
+            highlightthickness=0, showvalue=False,
+            command=_update_conf_label,
+            length=160,
+        ).pack(side="left")
+        tk.Label(cf, textvariable=self._conf_label_var,
+                 bg=BG_MID, fg=ACCENT, font=("Consolas", 10, "bold"),
+                 width=4).pack(side="left", padx=4)
+
+        tk.Label(parent, text="(turunkan jika kurang deteksi)",
+                 bg=BG_MID, fg=TEXT_SUB, font=("Segoe UI", 7)).pack(anchor="w", padx=12)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=8, pady=8)
+
+        # Detect button
+        self._detect_btn = ttk.Button(
+            parent, text="▶  Jalankan Deteksi",
+            style="Accent.TButton",
+            command=self._run_detection,
+            state="disabled",
+        )
+        self._detect_btn.pack(fill="x", padx=12, pady=4)
+
+        # Progress bar
+        self._progress = ttk.Progressbar(parent, mode="indeterminate")
+        self._progress.pack(fill="x", padx=12, pady=2)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=8, pady=8)
+
+        # Results
+        tk.Label(parent, text="📊 HASIL", bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", **pad)
+
+        self._stats_frame = tk.Frame(parent, bg=BG_MID)
+        self._stats_frame.pack(fill="x", padx=12)
+
+        self._stat_vars = {}
+        for key, label in [
+            ("mode",      "Mode"),
+            ("detected",  "Deteksi"),
+            ("latency",   "Latency"),
+            ("fps",       "FPS"),
+            ("patches",   "Patches"),
+        ]:
+            row = tk.Frame(self._stats_frame, bg=BG_MID)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=f"{label}:", bg=BG_MID, fg=TEXT_SUB,
+                     font=("Segoe UI", 8), width=8, anchor="w").pack(side="left")
+            var = tk.StringVar(value="—")
+            self._stat_vars[key] = var
+            tk.Label(row, textvariable=var, bg=BG_MID, fg=TEXT_MAIN,
+                     font=("Consolas", 9)).pack(side="left")
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=8, pady=6)
+
+        # Detection list
+        tk.Label(parent, text="🏷️  Daftar Deteksi", bg=BG_MID, fg=TEXT_SUB,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", **pad)
+
+        det_frame = tk.Frame(parent, bg=BG_MID)
+        det_frame.pack(fill="both", expand=True, padx=8, pady=4)
+
+        scrollbar = ttk.Scrollbar(det_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        self._det_list = tk.Listbox(
+            det_frame, yscrollcommand=scrollbar.set,
+            bg=BG_CARD, fg=TEXT_MAIN,
+            font=("Consolas", 8), selectbackground=ACCENT,
+            relief="flat", borderwidth=0,
+        )
+        self._det_list.pack(fill="both", expand=True)
+        scrollbar.config(command=self._det_list.yview)
+
+    def _build_right_panel(self, parent):
+        # Tab: Original | Result | SAHI Fragments | Video
+        self._nb = ttk.Notebook(parent)
+        self._nb.pack(fill="both", expand=True)
+
+        style = ttk.Style()
+        style.configure("TNotebook",        background=BG_DARK)
+        style.configure("TNotebook.Tab",    background=BG_MID, foreground=TEXT_MAIN,
+                        font=("Segoe UI", 9))
+        style.map("TNotebook.Tab",
+                  background=[("selected", BG_CARD)],
+                  foreground=[("selected", TEXT_MAIN)])
+
+        # Tab 1: Original
+        self._tab_orig = tk.Frame(self._nb, bg=BG_DARK)
+        self._nb.add(self._tab_orig, text="🖼️  Gambar Asli")
+        self._canvas_orig = tk.Canvas(self._tab_orig, bg="#111", highlightthickness=0)
+        self._canvas_orig.pack(fill="both", expand=True)
+        self._tk_img_orig = None
+
+        # Tab 2: Result
+        self._tab_result = tk.Frame(self._nb, bg=BG_DARK)
+        self._nb.add(self._tab_result, text="🎯  Hasil Deteksi")
+        self._canvas_result = tk.Canvas(self._tab_result, bg="#111", highlightthickness=0)
+        self._canvas_result.pack(fill="both", expand=True)
+        self._tk_img_result = None
+
+        # Tab 3: SAHI Fragments
+        self._tab_sahi = tk.Frame(self._nb, bg=BG_DARK)
+        self._nb.add(self._tab_sahi, text="🔲  Fragmentasi SAHI")
+        self._canvas_sahi = tk.Canvas(self._tab_sahi, bg="#111", highlightthickness=0)
+        self._canvas_sahi.pack(fill="both", expand=True)
+        self._tk_img_sahi = None
+
+        # Tab 4: Video ── BARU ──
+        self._tab_video = tk.Frame(self._nb, bg=BG_DARK)
+        self._nb.add(self._tab_video, text="🎥  Video")
+        self._canvas_video = tk.Canvas(self._tab_video, bg="#111", highlightthickness=0)
+        self._canvas_video.pack(fill="both", expand=True)
+
+        # Placeholder text
+        for canvas, txt in [
+            (self._canvas_orig,   "Upload gambar untuk mulai"),
+            (self._canvas_result, "Jalankan deteksi untuk melihat hasil"),
+            (self._canvas_sahi,   "Tab ini menampilkan grid fragmentasi SAHI"),
+            (self._canvas_video,  "Upload video lalu tekan ▶ Play"),
+        ]:
+            canvas.create_text(
+                400, 300, text=txt,
+                fill=TEXT_SUB, font=("Segoe UI", 13),
+                tags="placeholder",
+            )
+
+    # ── Model Loading ─────────────────────────────────────────────────────
+
+    def _load_model_async(self):
+        def _load():
+            try:
+                self.model = load_yolo_model(self.model_path)
+                self.root.after(0, self._on_model_loaded)
+            except Exception as e:
+                self.root.after(0, lambda: self._set_status(f"❌ Gagal load model: {e}", "red"))
+
+        t = threading.Thread(target=_load, daemon=True)
+        t.start()
+
+    def _on_model_loaded(self):
+        self._set_status(f"✅ Model siap — {Path(self.model_path).name}", SUCCESS)
+        if self.img_bgr is not None:
+            self._detect_btn.config(state="normal")
+
+    # ── Image Upload ──────────────────────────────────────────────────────
+
+    def _upload_image(self):
+        path = filedialog.askopenfilename(
+            title="Pilih Gambar",
+            filetypes=[
+                ("Gambar", "*.jpg *.jpeg *.png *.bmp *.tiff *.webp"),
+                ("Semua file", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        img_bgr = cv2.imread(path)
+        if img_bgr is None:
+            messagebox.showerror("Error", f"Gagal membaca gambar:\n{path}")
+            return
+
+        self.img_bgr  = img_bgr
+        self.img_path = path
+        self._filename_var.set(Path(path).name)
+
+        # Show original
+        self._show_image_on_canvas(
+            self._canvas_orig, img_bgr, tag="orig"
+        )
+        self._nb.select(self._tab_orig)
+
+        # Clear results
+        self._clear_result_canvas()
+        self._clear_sahi_canvas()
+
+        if self.model is not None:
+            self._detect_btn.config(state="normal")
+
+    # ── Video Upload & Playback ────────────────────────────────────────────
+
+    def _upload_video(self):
+        """Buka file dialog untuk memilih video."""
+        path = filedialog.askopenfilename(
+            title="Pilih Video",
+            filetypes=[
+                ("Video", "*.mp4 *.avi *.mov *.mkv *.wmv *.webm *.m4v"),
+                ("Semua file", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        # Hentikan video sebelumnya kalau ada
+        self._video_stop()
+
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            messagebox.showerror("Error", f"Gagal membuka video:\n{path}")
+            return
+
+        self._video_cap  = cap
+        self._video_path = path
+        self._videoname_var.set(Path(path).name)
+
+        total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps_src = cap.get(cv2.CAP_PROP_FPS) or 30
+        self._video_fps_src = fps_src
+        self._video_total   = total
+        self._video_progress_var.set(f"Frame: 0 / {total}  |  {fps_src:.1f}fps")
+
+        # Tampilkan frame pertama sebagai preview
+        ret, frame = cap.read()
+        if ret:
+            self._show_image_on_canvas(self._canvas_video, frame, tag="video")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # rewind ke awal
+
+        self._nb.select(self._tab_video)
+        self._play_btn.config(state="normal")
+        self._stop_btn.config(state="normal")
+        self._set_status(f"✅ Video dimuat: {Path(path).name}", SUCCESS)
+
+    def _video_play_pause(self):
+        """Toggle play / pause video."""
+        if self._video_cap is None:
+            return
+
+        if not self._video_running:
+            # Mulai / lanjutkan
+            self._video_running = True
+            self._video_paused  = False
+            self._play_btn.config(text="⏸ Pause")
+            self._nb.select(self._tab_video)
+            t = threading.Thread(target=self._video_loop, daemon=True)
+            t.start()
+        else:
+            # Pause / resume
+            self._video_paused = not self._video_paused
+            if self._video_paused:
+                self._play_btn.config(text="▶ Resume")
+                self._set_status("⏸ Video dijeda", WARNING)
+            else:
+                self._play_btn.config(text="⏸ Pause")
+                self._set_status("▶ Video berjalan...", SUCCESS)
+
+    def _on_video_mode_change(self):
+        """Tampilkan peringatan saat mode SAHI dipilih untuk video."""
+        if self._video_mode_var.get() == "sahi":
+            self._video_mode_warn.config(
+                text="⚠️ SAHI lebih lambat! "
+                     "FPS turun drastis karena tiap frame diproses "
+                     "N patch. Cocok untuk analisis, bukan realtime."
+            )
+        else:
+            self._video_mode_warn.config(text="")
+
+    def _video_stop(self):
+        """Hentikan video dan reset state."""
+        self._video_running = False
+        self._video_paused  = False
+        if self._video_cap is not None:
+            self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self._play_btn.config(text="\u25b6 Play")
+        self._video_progress_var.set(f"Frame: 0 / {getattr(self, '_video_total', 0)}")
+        self._set_status("\u23f9 Video dihentikan", TEXT_SUB)
+
+    # ── inference helpers untuk video ──────────────────────────────────
+
+    def _infer_yolo_frame(self, frame, conf):
+        """YOLO inference pada 1 frame penuh. Returns (boxes, scores, cls_ids)."""
+        import torch
+        with torch.no_grad():
+            results = self.model(
+                frame, conf=conf, iou=0.5,
+                device="cpu", verbose=False, imgsz=SLICE_SIZE,
+            )
+        r = results[0].boxes
+        if r is not None and len(r) > 0:
+            return (
+                r.xyxy.cpu().numpy(),
+                r.conf.cpu().numpy(),
+                r.cls.cpu().numpy().astype(int),
+            )
+        return np.empty((0, 4)), np.empty(0), np.empty(0, int)
+
+    def _infer_sahi_frame(self, frame, conf, slice_size, overlap):
+        """
+        YOLO+SAHI inference pada 1 frame:
+        potong menjadi N patch → inference per patch → merge + NMS.
+        Returns (boxes, scores, cls_ids, n_patches).
+        """
+        H, W   = frame.shape[:2]
+        slices = generate_slices(H, W, slice_size, overlap)
+
+        all_boxes, all_scores, all_cls = [], [], []
+        for (x1, y1, x2, y2) in slices:
+            patch = frame[y1:y2, x1:x2]
+            ph, pw = patch.shape[:2]
+            if pw != slice_size or ph != slice_size:
+                patch = cv2.resize(patch, (slice_size, slice_size))
+                sx = (x2 - x1) / slice_size
+                sy = (y2 - y1) / slice_size
+            else:
+                sx = sy = 1.0
+
+            b, s, c = run_yolo_on_patch(self.model, patch, device="cpu", conf=conf)
+            if len(b) > 0:
+                b = b.copy()
+                b[:, [0, 2]] = np.clip(b[:, [0, 2]] * sx + x1, 0, W)
+                b[:, [1, 3]] = np.clip(b[:, [1, 3]] * sy + y1, 0, H)
+                all_boxes.append(b)
+                all_scores.append(s)
+                all_cls.append(c)
+
+        if all_boxes:
+            mb = np.concatenate(all_boxes)
+            ms = np.concatenate(all_scores)
+            mc = np.concatenate(all_cls)
+            fb, fs, fc = multiclass_nms_numpy(mb, ms, mc)
+        else:
+            fb = np.empty((0, 4))
+            fs = np.empty(0)
+            fc = np.empty(0, int)
+
+        return fb, fs, fc, len(slices)
+
+    def _video_loop(self):
+        """
+        Background thread: baca frame → inference (YOLO atau SAHI) → tampilkan.
+        """
+        import time as _time
+
+        cap        = self._video_cap
+        fps_src    = getattr(self, "_video_fps_src", 30)
+        total      = getattr(self, "_video_total", 0)
+        delay      = 1.0 / max(fps_src, 1)
+        conf       = float(self._conf_var.get())
+        video_mode = self._video_mode_var.get()       # "yolo" atau "sahi"
+        slice_size = self._slice_var.get()
+        overlap    = self._overlap_var.get()
+
+        while self._video_running:
+            if self._video_paused:
+                _time.sleep(0.05)
+                continue
+
+            t0  = _time.perf_counter()
+            ret, frame = cap.read()
+
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                self.root.after(0, lambda: self._play_btn.config(text="\u25b6 Play"))
+                self.root.after(0, lambda: self._set_status("\u2705 Video selesai", SUCCESS))
+                self._video_running = False
+                break
+
+            frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+
+            # ── Inference sesuai mode ─────────────────────────────────
+            if video_mode == "sahi":
+                boxes, scores, cls_ids, n_patches = self._infer_sahi_frame(
+                    frame, conf, slice_size, overlap
+                )
+                mode_label = f"Video-SAHI ({n_patches}p)"
+            else:
+                boxes, scores, cls_ids = self._infer_yolo_frame(frame, conf)
+                n_patches  = None
+                mode_label = "Video-YOLO"
+
+            # ── Gambar bounding box ──────────────────────────────────
+            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_out = draw_boxes_pil(Image.fromarray(img_rgb), boxes, scores, cls_ids)
+
+            t1  = _time.perf_counter()
+            ms  = (t1 - t0) * 1000
+            fps = 1000.0 / ms if ms > 0 else 0
+
+            # ── Update UI ─────────────────────────────────────────
+            def _update(pil_out=pil_out, n=len(boxes), ms=ms, fps=fps,
+                        fi=frame_idx, tot=total, ml=mode_label, np_=n_patches):
+                self._show_pil_on_canvas(self._canvas_video, pil_out, tag="video")
+                patch_str = f" | {np_}patch" if np_ is not None else ""
+                self._video_progress_var.set(
+                    f"Frame: {fi}/{tot}{patch_str}  |  {n} obj  |  {ms:.0f}ms  |  {fps:.1f}fps"
+                )
+                self._update_stats(ml, n, ms, fps,
+                                   patches=np_ if np_ is not None else None)
+
+            self.root.after(0, _update)
+
+            # Throttle (untuk YOLO saja; SAHI sudah lambat secara natural)
+            if video_mode == "yolo":
+                elapsed = _time.perf_counter() - t0
+                wait    = max(0.0, delay - elapsed)
+                if wait > 0:
+                    _time.sleep(wait)
+
+    # ── Canvas Helpers ────────────────────────────────────────────────────
+
+    def _show_image_on_canvas(self, canvas, img_bgr, tag="img"):
+        """Resize + tampilkan gambar BGR ke canvas."""
+        canvas.update_idletasks()
+        cw = max(100, canvas.winfo_width())
+        ch = max(100, canvas.winfo_height())
+
+        h, w = img_bgr.shape[:2]
+        scale = min(cw / w, ch / h, 1.0)
+        nw = max(1, int(w * scale))
+        nh = max(1, int(h * scale))
+
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb).resize((nw, nh), Image.LANCZOS)
+        tk_img  = ImageTk.PhotoImage(pil_img)
+
+        canvas.delete("all")
+        canvas.create_image(cw // 2, ch // 2, anchor="center", image=tk_img, tags=tag)
+
+        # Keep reference
+        if tag == "orig":
+            self._tk_img_orig   = tk_img
+        elif tag == "result":
+            self._tk_img_result = tk_img
+        elif tag == "sahi":
+            self._tk_img_sahi   = tk_img
+        else:
+            canvas._img_ref = tk_img
+
+        return scale, nw, nh
+
+    def _show_pil_on_canvas(self, canvas, pil_img, tag="img"):
+        """Resize + tampilkan PIL Image ke canvas."""
+        canvas.update_idletasks()
+        cw = max(100, canvas.winfo_width())
+        ch = max(100, canvas.winfo_height())
+
+        w, h   = pil_img.size
+        scale  = min(cw / w, ch / h, 1.0)
+        nw = max(1, int(w * scale))
+        nh = max(1, int(h * scale))
+        pil_r  = pil_img.resize((nw, nh), Image.LANCZOS)
+        tk_img = ImageTk.PhotoImage(pil_r)
+
+        canvas.delete("all")
+        canvas.create_image(cw // 2, ch // 2, anchor="center", image=tk_img, tags=tag)
+
+        if tag == "result":
+            self._tk_img_result = tk_img
+        elif tag == "sahi":
+            self._tk_img_sahi = tk_img
+        else:
+            canvas._img_ref = tk_img
+
+    def _clear_result_canvas(self):
+        self._canvas_result.delete("all")
+        self._canvas_result.create_text(
+            400, 300, text="Jalankan deteksi untuk melihat hasil",
+            fill=TEXT_SUB, font=("Segoe UI", 13), tags="placeholder"
+        )
+
+    def _clear_sahi_canvas(self):
+        self._canvas_sahi.delete("all")
+        self._canvas_sahi.create_text(
+            400, 300, text="Tab ini menampilkan grid fragmentasi SAHI",
+            fill=TEXT_SUB, font=("Segoe UI", 13), tags="placeholder"
+        )
+
+    # ── Detection ─────────────────────────────────────────────────────────
+
+    def _run_detection(self):
+        if self.img_bgr is None or self.model is None or self._running:
+            return
+
+        mode = self._mode_var.get()
+        self._running = True
+        self._detect_btn.config(state="disabled")
+        self._progress.start(10)
+        self._det_list.delete(0, "end")
+        self._set_status("⏳ Mendeteksi...", WARNING)
+
+        if mode == "yolo":
+            t = threading.Thread(target=self._thread_yolo, daemon=True)
+        else:
+            t = threading.Thread(target=self._thread_sahi, daemon=True)
+        t.start()
+
+    def _thread_yolo(self):
+        """YOLO-only inference thread."""
+        try:
+            img  = self.img_bgr.copy()
+            conf = float(self._conf_var.get())
+            boxes, scores, cls_ids, ms = run_yolo_full(
+                self.model, img, device="cpu", conf=conf
+            )
+            self.root.after(0, lambda: self._finish_yolo(img, boxes, scores, cls_ids, ms))
+        except Exception as e:
+            self.root.after(0, lambda: self._on_error(str(e)))
+
+    def _finish_yolo(self, img_bgr, boxes, scores, cls_ids, ms):
+        self._stop_progress()
+
+        # Draw result
+        img_rgb  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_img  = Image.fromarray(img_rgb)
+        pil_res  = draw_boxes_pil(pil_img.copy(), boxes, scores, cls_ids)
+        self._show_pil_on_canvas(self._canvas_result, pil_res, tag="result")
+        self._nb.select(self._tab_result)
+
+        fps = 1000.0 / ms if ms > 0 else 0
+        self._update_stats("YOLO-only", len(boxes), ms, fps, patches=None)
+        self._fill_detection_list(boxes, scores, cls_ids)
+        self._set_status(f"✅ YOLO-only: {len(boxes)} deteksi | {ms:.0f}ms | {fps:.1f}FPS", SUCCESS)
+
+    def _thread_sahi(self):
+        """YOLO+SAHI slicing thread dengan animasi fragmentasi."""
+        try:
+            img   = self.img_bgr.copy()
+            H, W  = img.shape[:2]
+            size  = self._slice_var.get()
+            ovlp  = self._overlap_var.get()
+            conf  = float(self._conf_var.get())
+            slices = generate_slices(H, W, size, ovlp)
+            n_slices = len(slices)
+
+            # Tampilkan grid awal di tab SAHI
+            self.root.after(0, lambda: self._show_sahi_grid(img, slices, -1, set()))
+            self.root.after(0, lambda: self._nb.select(self._tab_sahi))
+
+            all_boxes, all_scores, all_cls = [], [], []
+            done = set()
+
+            t_start = time.perf_counter()
+            for i, (x1, y1, x2, y2) in enumerate(slices):
+                # Animasikan patch yang sedang diproses
+                self.root.after(0, lambda i=i: self._show_sahi_grid(img, slices, i, set(range(i))))
+                self.root.after(0, lambda i=i, n=n_slices: self._set_status(
+                    f"⏳ SAHI: patch {i+1}/{n}...", WARNING
+                ))
+
+                # Crop + resize patch
+                patch = img[y1:y2, x1:x2]
+                ph, pw = patch.shape[:2]
+                if pw != size or ph != size:
+                    patch = cv2.resize(patch, (size, size))
+                    sx = (x2 - x1) / size
+                    sy = (y2 - y1) / size
+                else:
+                    sx = sy = 1.0
+
+                # Run YOLO
+                b, s, c = run_yolo_on_patch(self.model, patch, device="cpu", conf=conf)
+
+                # Transform ke original coords
+                if len(b) > 0:
+                    b = b.copy()
+                    b[:, [0, 2]] = np.clip(b[:, [0, 2]] * sx + x1, 0, W)
+                    b[:, [1, 3]] = np.clip(b[:, [1, 3]] * sy + y1, 0, H)
+                    all_boxes.append(b)
+                    all_scores.append(s)
+                    all_cls.append(c)
+
+                done.add(i)
+
+            t_end = time.perf_counter()
+            ms = (t_end - t_start) * 1000
+
+            # Merge + NMS
+            if all_boxes:
+                merged_b = np.concatenate(all_boxes)
+                merged_s = np.concatenate(all_scores)
+                merged_c = np.concatenate(all_cls)
+                final_b, final_s, final_c = multiclass_nms_numpy(merged_b, merged_s, merged_c)
+            else:
+                final_b = np.empty((0, 4))
+                final_s = np.empty(0)
+                final_c = np.empty(0, int)
+
+            self.root.after(0, lambda: self._finish_sahi(
+                img, slices, done, final_b, final_s, final_c, ms, n_slices
+            ))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.root.after(0, lambda: self._on_error(str(e)))
+
+    def _show_sahi_grid(self, img_bgr, slices, active_idx, done_indices):
+        """Update canvas SAHI dengan grid fragmentasi."""
+        img_rgb  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_img  = Image.fromarray(img_rgb)
+        pil_grid = draw_slice_grid(pil_img, slices, active_idx, done_indices)
+        self._show_pil_on_canvas(self._canvas_sahi, pil_grid, tag="sahi")
+
+    def _finish_sahi(self, img_bgr, slices, done, boxes, scores, cls_ids, ms, n_slices):
+        self._stop_progress()
+
+        # Tampilkan grid selesai di tab SAHI
+        self._show_sahi_grid(img_bgr, slices, -1, done)
+
+        # Tampilkan hasil akhir di tab result
+        img_rgb  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_img  = Image.fromarray(img_rgb)
+        pil_res  = draw_boxes_pil(pil_img.copy(), boxes, scores, cls_ids)
+        self._show_pil_on_canvas(self._canvas_result, pil_res, tag="result")
+        self._nb.select(self._tab_result)
+
+        fps = 1000.0 / ms if ms > 0 else 0
+        self._update_stats("YOLO+SAHI", len(boxes), ms, fps, n_slices)
+        self._fill_detection_list(boxes, scores, cls_ids)
+        self._set_status(
+            f"✅ YOLO+SAHI: {len(boxes)} deteksi | {n_slices} patch | "
+            f"{ms:.0f}ms | {fps:.1f}FPS",
+            SUCCESS
+        )
+
+    # ── UI Helpers ────────────────────────────────────────────────────────
+
+    def _stop_progress(self):
+        self._running = False
+        self._progress.stop()
+        self._detect_btn.config(state="normal")
+
+    def _on_error(self, msg):
+        self._stop_progress()
+        self._set_status(f"❌ Error: {msg}", "red")
+        messagebox.showerror("Error", msg)
+
+    def _set_status(self, text, color=TEXT_MAIN):
+        self._status_var.set(text)
+
+    def _update_stats(self, mode, n_det, ms, fps, patches):
+        self._stat_vars["mode"].set(mode)
+        self._stat_vars["detected"].set(f"{n_det} objek")
+        self._stat_vars["latency"].set(f"{ms:.0f} ms")
+        self._stat_vars["fps"].set(f"{fps:.2f}")
+        self._stat_vars["patches"].set(str(patches) if patches else "—")
+
+    def _fill_detection_list(self, boxes, scores, cls_ids):
+        self._det_list.delete(0, "end")
+        for i in range(len(boxes)):
+            cid   = int(cls_ids[i]) if i < len(cls_ids) else 0
+            score = float(scores[i]) if i < len(scores) else 0.0
+            name  = CLASS_NAMES[cid] if cid < len(CLASS_NAMES) else "obj"
+            self._det_list.insert("end", f"#{i+1:02d} {name} ({score:.2f})")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="GUI Deteksi Sampah")
+    parser.add_argument(
+        "--model",
+        default="C:/yolo_out/rft_run/weights/best.pt",  # ← model RFT 100 epoch
+        help="Path model weights (.pt)"
+    )
+    args = parser.parse_args()
+
+    root = tk.Tk()
+    app  = TrashDetectionApp(root, model_path=args.model)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

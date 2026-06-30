@@ -1,0 +1,63 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual Environments ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+miniconda/
+miniconda_installer.exe
+
+# ── Model Weights ─────────────────────────────────────────────────────────────
+# weights/ folder DISERTAKAN (best.pt dicommit ke repo)
+!weights/
+!weights/*.pt
+runs/
+# File model base yang besar (bukan hasil training)
+yolo11n.pt
+yolov8n.pt
+*.onnx
+*.tflite
+*.engine
+
+# ── Dataset (jangan di-upload ke GitHub) ──────────────────────────────────────
+data/datasets/
+data/raw/
+data/raw_2/
+data/yolo/
+data/yolo_2/
+
+# ── Log & Hasil Eksperimen ────────────────────────────────────────────────────
+logs/
+results/
+preprocess_log.txt
+
+# ── File Sementara / Temporary ─────────────────────────────────────────────────
+*.log
+*.tmp
+add_roi_feature.py
+fix_gui*.py
+
+# ── Testing cache ──────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── OS Files ───────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE / Editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/

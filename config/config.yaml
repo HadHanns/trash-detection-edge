@@ -1,0 +1,147 @@
+# ============================================================
+# config.yaml — Konfigurasi Utama Proyek
+# Trash Detection on Urban Waterways
+# ============================================================
+
+# ── Project Paths ──────────────────────────────────────────
+project:
+  name: "trash-detection-edge"
+  version: "1.0.0"
+  root_dir: "./"
+  data_dir: "./data"
+  weights_dir: "./weights"
+  results_dir: "./results"
+  logs_dir: "./logs"
+
+# ── Dataset Configuration ──────────────────────────────────
+dataset:
+  name: "TACO"
+  source_url: "https://github.com/pedropro/TACO"
+  annotations_url: "https://raw.githubusercontent.com/pedropro/TACO/master/data/annotations.json"
+  images_dir: "./data/raw/images"
+  annotations_file: "./data/raw/annotations.json"
+  processed_dir: "./data/processed"
+  yolo_dir: "./data/yolo"
+
+  # Split ratios
+  train_ratio: 0.70
+  val_ratio: 0.20
+  test_ratio: 0.10
+  random_seed: 42
+
+  # TACO class mapping → simplified super-classes for water channel domain
+  # Maps TACO category names to our unified label index
+  class_mapping:
+    "Plastic bottle": 0
+    "Plastic bag & wrapper": 1
+    "Wrapper": 1
+    "Plastic film": 1
+    "Drink carton": 2
+    "Carton": 2
+    "Paper bag": 2
+    "Plastic cup": 3
+    "Styrofoam cup": 4
+    "Styrofoam piece": 4
+    "Cigarette": 5
+    "Other plastic": 6
+    "Other litter": 6
+    "Rope & strings": 6
+
+  class_names:
+    0: "plastic_bottle"
+    1: "plastic_bag"
+    2: "carton"
+    3: "cup"
+    4: "styrofoam"
+    5: "cigarette"
+    6: "other_trash"
+
+  num_classes: 7
+
+# ── Model Configuration ─────────────────────────────────────
+model:
+  # Primary: YOLOv11n | Fallback: yolov8n
+  primary: "yolo11n.pt"
+  fallback: "yolov8n.pt"
+  architecture: "yolo11n"    # trained locally on TACO dataset
+  pretrained: false          # menggunakan bobot hasil training lokal
+  weights_path: "./weights/best.pt"   # hasil training 68 epoch, best@48, mAP50=0.324
+  export_formats:
+    - "onnx"
+    - "torchscript"
+
+# ── Training Hyperparameters ────────────────────────────────
+training:
+  epochs: 100                # ran 68 epochs (early stop patience=20, best@48)
+  imgsz: 640
+  batch: 4                   # GTX 970 4GB VRAM
+  optimizer: "AdamW"
+  lr0: 0.01                  # initial learning rate (cosine schedule)
+  lrf: 0.001                 # final learning rate
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  patience: 15               # early stopping patience
+  save_period: 10            # save checkpoint every N epochs
+  device: "0"              # edge simulation: CPU only -> Changed to 0 (GPU)
+  workers: 2                 # max dataloader workers untuk CPU inference
+  amp: false                 # no AMP on CPU edge simulation
+  cos_lr: true               # cosine LR scheduler
+  
+  # Augmentation (applied during training)
+  augmentation:
+    mosaic: 1.0
+    mixup: 0.1
+    copy_paste: 0.1
+    degrees: 10.0
+    translate: 0.1
+    scale: 0.5
+    shear: 2.0
+    perspective: 0.0
+    flipud: 0.1
+    fliplr: 0.5
+    hsv_h: 0.015
+    hsv_s: 0.7
+    hsv_v: 0.4
+
+# ── SAHI Configuration ──────────────────────────────────────
+sahi:
+  enabled: true
+  slice_height: 640
+  slice_width: 640
+  overlap_height_ratio: 0.2
+  overlap_width_ratio: 0.2
+  postprocess_type: "NMS"         # Non-Maximum Suppression
+  postprocess_match_threshold: 0.5
+  confidence_threshold: 0.25
+  iou_threshold: 0.5
+  # Fallback manual slicing (used if SAHI library unavailable)
+  use_manual_fallback: false
+
+# ── CPU Inference Settings ──────────────────────────────────────────────────
+cpu_inference:
+  device: "0"               # Inference menggunakan GPU
+  num_threads: 4              # Thread CPU (opsional, sesuaikan dengan mesin lokal)
+  # Benchmark settings
+  warmup_runs: 3              # Inference warmup sebelum pengukuran
+  benchmark_runs: 20          # Jumlah run untuk benchmark
+
+# ── Evaluation Metrics ──────────────────────────────────────
+evaluation:
+  iou_thresholds: [0.5, 0.75]
+  small_object_area_threshold: 1024  # pixels^2 (< 32x32 = small)
+  conf_threshold: 0.25
+  nms_iou_threshold: 0.5
+  output_csv: "./results/metrics/benchmark_results.csv"
+  visualize_predictions: true
+  max_visualizations: 50     # max images to save
+
+# ── Water Channel Augmentation ──────────────────────────────
+water_augmentation:
+  enabled: true
+  background_sources:
+    - "data/backgrounds/water_channels"
+  alpha_blend_range: [0.6, 1.0]   # opacity range for overlaid objects
+  num_synthetic_images: 200        # synthetic water channel images to generate
+  noise_std: 10                    # Gaussian noise for camera simulation
+  blur_kernel: 3                   # blur for lens quality simulation
