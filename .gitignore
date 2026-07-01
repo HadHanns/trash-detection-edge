@@ -32,10 +32,11 @@ data/raw_2/
 data/yolo/
 data/yolo_2/
 
-# ── Log & Hasil Eksperimen ────────────────────────────────────────────────────
+# 🚀 Log & Hasil Eksperimen 🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀
 logs/
 results/
 preprocess_log.txt
+snapshots/
 
 # ── File Sementara / Temporary ─────────────────────────────────────────────────
 *.log
