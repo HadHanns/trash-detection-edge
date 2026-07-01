@@ -1275,7 +1275,10 @@ def main():
     parser = argparse.ArgumentParser(description="GUI Deteksi Sampah")
     parser.add_argument(
         "--model",
-        default="C:/yolo_out/rft_run/weights/best.pt",  # ← model RFT 100 epoch
+        # default="C:/yolo_out/rft_run/weights/best.pt",       # ← YOLOv11n
+        # default="C:/yolo_out/rft_yolov8n/weights/best_yolov8n.pt",  # ← YOLOv8n (C drive)
+        default="weights/best_yolov8n.pt",                     # ← YOLOv8n (folder lokal)
+        # default="weights/best.pt",                     # ← YOLOv11n (folder lokal)
         help="Path model weights (.pt)"
     )
     args = parser.parse_args()
