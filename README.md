@@ -1,7 +1,7 @@
-# 🗑️ Trash Detection — YOLOv11 + SAHI + Polygon ROI
+# 🗑️ Trash Detection — YOLO + SAHI + Polygon ROI
 ## Sistem Deteksi Sampah Berbasis Deep Learning | CPU-only Edge Simulation
 
-> **Skripsi** — Deteksi Sampah di Lingkungan Terbuka Menggunakan YOLOv11n, SAHI (Slicing Aided Hyper Inference), dan GUI Interaktif  
+> **Skripsi** — Deteksi Sampah di Lingkungan Terbuka Menggunakan YOLOv11n & YOLOv8n, SAHI (Slicing Aided Hyper Inference), dan GUI Interaktif  
 > Dataset: **Kaggle RFT Trash Detection (8 Kelas)** | Training: 100 Epoch | Inference: CPU-only
 
 ---
@@ -12,9 +12,9 @@ Proyek ini mengimplementasikan sistem deteksi sampah skala kecil (botol, kantong
 
 | Komponen | Detail |
 |----------|--------|
-| **Model** | YOLOv11n (Ultralytics ≥ 8.3) |
+| **Model** | YOLOv11n & YOLOv8n (Ultralytics ≥ 8.3) |
 | **Dataset** | Kaggle RFT Trash Detection — 8 Kelas |
-| **Training** | 100 Epoch, Batch 8, Imgsz 640, CPU/GPU |
+| **Training** | 100 Epoch, Batch 4–8, Imgsz 640, GPU |
 | **SAHI** | Slice 640×640, Overlap 20%, Postprocess: NMS |
 | **Inference** | CPU-only (`torch.device('cpu')`) |
 | **GUI** | Tkinter — Gambar & Video, YOLO vs YOLO+SAHI, Polygon ROI |
@@ -63,13 +63,15 @@ trash-detection-edge/
 │   ├── 02_training.ipynb
 │   └── 03_inference_evaluation.ipynb
 ├── weights/
-│   └── best.pt                  # Model hasil training 100 epoch
+│   ├── best.pt                  # YOLOv11n — model hasil training 100 epoch
+│   └── best_yolov8n.pt          # YOLOv8n — model hasil training 100 epoch
 ├── results/
 │   ├── metrics/                 # CSV benchmark results
 │   └── visualizations/          # Output detection images
 ├── tests/
 │   └── test_pipeline.py
-├── train_final.py               # Script training utama
+├── train_final.py               # Script training YOLOv11n
+├── train_yolov8n.py             # Script training YOLOv8n
 ├── requirements.txt
 └── README.md
 ```
@@ -99,18 +101,26 @@ data/datasets/
 ### 3. Training Model
 
 ```bash
+# Training YOLOv11n
 .\miniconda\python.exe train_final.py
+
+# Training YOLOv8n
+.\miniconda\python.exe train_yolov8n.py
 ```
 
-Model terbaik akan tersimpan di `C:/yolo_out/rft_run/weights/best.pt`.
+Model terbaik akan disalin otomatis ke folder `weights/`:
+- `weights/best.pt` — YOLOv11n
+- `weights/best_yolov8n.pt` — YOLOv8n
 
 ### 4. Jalankan GUI
 
 ```bash
+# Menggunakan YOLOv8n (default)
 .\miniconda\python.exe src\gui.py
 
-# Atau dengan path model custom
-.\miniconda\python.exe src\gui.py --model weights/best.pt
+# Atau pilih model secara manual
+.\miniconda\python.exe src\gui.py --model weights/best.pt           # YOLOv11n
+.\miniconda\python.exe src\gui.py --model weights/best_yolov8n.pt   # YOLOv8n
 ```
 
 ---
@@ -207,17 +217,20 @@ Gambar / Frame Video (resolusi tinggi)
 ## 🔬 Pipeline Deteksi Penuh
 
 ```bash
-# 1. Training
+# 1a. Training YOLOv11n
 .\miniconda\python.exe train_final.py
 
-# 2. Evaluasi model (opsional)
-.\miniconda\python.exe src\inference_sahi.py \
-    --model weights/best.pt \
-    --source data/datasets/test/images/ \
-    --compare --benchmark
+# 1b. Training YOLOv8n
+.\miniconda\python.exe train_yolov8n.py
 
-# 3. Demo GUI
+# 2. Evaluasi model (opsional)
+.\miniconda\python.exe src\benchmark.py --model weights/best.pt --split test --max-images 50
+
+# 3. Demo GUI (YOLOv8n default)
 .\miniconda\python.exe src\gui.py
+
+# 3b. Demo GUI dengan YOLOv11n
+.\miniconda\python.exe src\gui.py --model weights/best.pt
 ```
 
 ---
@@ -238,7 +251,7 @@ psutil>=5.9.0        # Resource monitoring
 
 ## 📄 Referensi
 
-- **YOLOv11**: [Ultralytics Docs](https://docs.ultralytics.com/) — YOLO11 (2024)
+- **YOLOv11 / YOLOv8**: [Ultralytics Docs](https://docs.ultralytics.com/) — YOLO11 & YOLO8 (2023–2024)
 - **SAHI**: [Akyon et al., 2022](https://arxiv.org/abs/2202.06934) — Slicing Aided Hyper Inference and Fine-tuning for Small Object Detection
 - **Dataset**: [Kaggle River Floating Trash Datasets](https://www.kaggle.com/datasets/zhiaun/river-floating-trash-datasets/data) — 8 Kelas Sampah
 
@@ -247,4 +260,4 @@ psutil>=5.9.0        # Resource monitoring
 ## 👤 Penulis
 
 Proyek Skripsi — Sistem Deteksi Sampah Berbasis Deep Learning  
-Model: YOLOv11n | Metode: YOLO vs YOLO+SAHI | Interface: GUI Interaktif dengan Polygon ROI
+Model: YOLOv11n & YOLOv8n | Metode: YOLO vs YOLO+SAHI | Interface: GUI Interaktif dengan Polygon ROI
