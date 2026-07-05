@@ -50,7 +50,7 @@ trash-detection-edge/
 │       ├── labels/{train,val,test}/
 │       └── data.yaml
 ├── src/
-│   ├── gui.py                   # 🖥️  GUI Interaktif Utama
+│   ├── gui_pro.py               # 🖥️  GUI Interaktif Utama (Advanced)
 │   ├── cpu_inference.py         # Utilitas inferensi CPU-only
 │   ├── trainer.py               # Fine-tuning YOLOv11n
 │   ├── inference_sahi.py        # Inference via SAHI
@@ -116,37 +116,46 @@ Model terbaik akan disalin otomatis ke folder `weights/`:
 
 ```bash
 # Menggunakan YOLOv8n (default)
-.\miniconda\python.exe src\gui.py
+.\miniconda\python.exe src\gui_pro.py
 
 # Atau pilih model secara manual
-.\miniconda\python.exe src\gui.py --model weights/best.pt           # YOLOv11n
-.\miniconda\python.exe src\gui.py --model weights/best_yolov8n.pt   # YOLOv8n
+.\miniconda\python.exe src\gui_pro.py --model weights/best.pt           # YOLOv11n
+.\miniconda\python.exe src\gui_pro.py --model weights/best_yolov8n.pt   # YOLOv8n
 ```
 
 ---
 
 ## 🖥️ Fitur GUI Interaktif
 
-GUI (`src/gui.py`) menyediakan antarmuka visual lengkap untuk demonstrasi dan pengujian sistem deteksi.
+GUI (`src/gui_pro.py`) menyediakan antarmuka visual lengkap dan canggih untuk demonstrasi dan pengujian sistem deteksi di *Edge*.
 
-### Panel Kiri — Kontrol
+### Panel Kiri — Kontrol Utama
 
 | Seksi | Fungsi |
 |-------|--------|
-| **📁 GAMBAR** | Upload gambar, pilih mode deteksi (YOLO/SAHI), jalankan deteksi |
-| **🎥 VIDEO** | Upload video, pilih mode deteksi, Play/Pause/Stop dengan inferensi real-time |
-| **📐 AREA DETEKSI (ROI)** | Gambar poligon ROI interaktif — hanya deteksi dalam area tertentu |
-| **🔧 PENGATURAN** | Slice size, overlap ratio, confidence threshold |
-| **📊 HASIL** | Statistik (mode, jumlah deteksi, latency, FPS, patches) + daftar deteksi |
+| **📁 SUMBER INPUT** | Pilih input dari Video lokal atau Webcam PC |
+| **🧠 WEIGHT YOLO** | Pilih file model `.pt`, `.engine`, atau `.onnx` via *browse* |
+| **✂️ SAHI - SLICING** | Aktifkan/nonaktifkan Slicing, atur ukuran slice & overlap |
+| **📐 REGION OF INTEREST** | Gambar poligon ROI. Bisa diaktifkan **Crop ke ROI** untuk inferensi jauh lebih cepat |
+| **⚙️ PARAMETER INFERENSI** | Pilih Hardware (CPU/CUDA), Confidence, IoU, dan **Sample Interval** (fps hemat CPU) |
+| **▶️ KONTROL SISTEM** | Tombol Mulai dan Stop deteksi |
 
-### Panel Kanan — Tab Visualisasi
+### Panel Kanan — Hasil & Edge Info
+
+| Seksi | Konten |
+|-------|--------|
+| **📈 STATISTIK DETEKSI** | Total Objek, Level Penumpukan (AMAN/WASPADA/KRITIS), % Coverage |
+| **📊 TREN (Matplotlib)** | Grafik live *Coverage %* dari waktu ke waktu |
+| **💻 STATUS EDGE** | Pantauan resource real-time CPU & RAM (`psutil`), FPS, Inference Time |
+| **📝 LOG AKTIVITAS** | Log sistem (model loaded, telegram sent, dll) |
+
+### Panel Tengah — Visualisasi & Pengaturan
 
 | Tab | Konten |
 |-----|--------|
-| **🖼️ Gambar Asli** | Tampilan gambar yang di-upload |
-| **🎯 Hasil Deteksi** | Output bounding box + label + confidence |
-| **🔲 Fragmentasi SAHI** | Grid slice yang menunjukkan proses fragmentasi |
-| **🎥 Video** | Playback video dengan inferensi real-time |
+| **🖼️ Deteksi Live** | Playback video dengan bounding box. Dilengkapi kontrol **Zoom (⊕/⊖)** dan **Snapshot (📷)** |
+| **⚙️ Pengaturan** | Set Bot Token Telegram, Chat ID, Jeda Notifikasi (Anti-Spam), dan Sertakan Foto Snapshot |
+| **📜 Log** | Histori log aktivitas secara lengkap |
 
 ---
 
@@ -160,10 +169,11 @@ Polygon ROI (Region of Interest) memungkinkan pengguna mendefinisikan area detek
 2. Di panel kiri, klik tombol **"Tentukan ROI"** — status berubah menjadi "Menggambar...".
 3. **Klik kiri** berulang kali di atas gambar/video untuk menambahkan titik batas area.
 4. **Klik kanan** untuk menutup dan menyelesaikan poligon (minimal 3 titik).
-5. Jalankan deteksi seperti biasa — hanya objek **di dalam area ROI** yang akan diproses.
-6. Klik **"Hapus ROI"** untuk kembali ke mode deteksi penuh.
+5. (Opsi) Centang **"Crop ke ROI"** agar sistem hanya memproses area di dalam poligon. Mempercepat deteksi secara signifikan.
+6. Jalankan deteksi seperti biasa — objek di luar area tidak akan diproses.
+7. Klik **"Hapus ROI"** untuk kembali ke mode deteksi penuh.
 
-> **Catatan:** Fitur ROI berjalan pada mode **YOLO-only** maupun **YOLO+SAHI**, baik untuk gambar maupun video.
+> **Catatan:** Jika *Crop ke ROI* aktif, maka ukuran gambar yang dikirim ke AI/YOLO akan jauh lebih kecil (menghemat CPU dan GPU usage).
 
 ---
 
@@ -227,10 +237,10 @@ Gambar / Frame Video (resolusi tinggi)
 .\miniconda\python.exe src\benchmark.py --model weights/best.pt --split test --max-images 50
 
 # 3. Demo GUI (YOLOv8n default)
-.\miniconda\python.exe src\gui.py
+.\miniconda\python.exe src\gui_pro.py
 
 # 3b. Demo GUI dengan YOLOv11n
-.\miniconda\python.exe src\gui.py --model weights/best.pt
+.\miniconda\python.exe src\gui_pro.py --model weights/best.pt
 ```
 
 ---
