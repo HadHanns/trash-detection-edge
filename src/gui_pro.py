@@ -461,11 +461,21 @@ class AdvancedTrashGUI:
         ttk.Button(zoom_f, text="⛶", width=3, command=self._zoom_reset).pack(side="left", padx=2)
         ttk.Button(zoom_f, text="📷", width=3, command=self._save_snapshot_quick).pack(side="left", padx=2)
         ttk.Button(zoom_f, text="Simpan Snapshot", style="White.TButton", command=self._save_snapshot_dialog).pack(side="left", padx=5)
+        
+        # Toggle SAHI Fragment View
+        tk.Frame(zoom_f, bg=BORDER_COLOR, width=1, height=20).pack(side="left", padx=8, pady=3)
+        self.var_show_sahi = tk.BooleanVar(value=False)
+        self.btn_sahi_toggle = tk.Checkbutton(
+            zoom_f, text="🔲 Tampilkan Grid SAHI",
+            variable=self.var_show_sahi, bg=BG_PANEL,
+            font=UI_FONT, fg=ACCENT_BLUE, selectcolor=BG_PANEL
+        )
+        self.btn_sahi_toggle.pack(side="left", padx=5)
 
         # Tab Hasil & Statistik
         self.tab_stats = tk.Frame(self.notebook, bg=BG_PANEL)
         self.notebook.add(self.tab_stats, text="Hasil & Statistik")
-        ttk.Label(self.tab_stats, text="Statistik akan muncul di sini.", style="Panel.TLabel").pack(pady=20)
+        self._build_stats_tab(self.tab_stats)
         
         # Tab Pengaturan
         self.tab_settings = tk.Frame(self.notebook, bg=BG_PANEL)
@@ -478,7 +488,148 @@ class AdvancedTrashGUI:
         self.txt_log_full = scrolledtext.ScrolledText(self.tab_log, font=MONO_FONT, bg="#f8f9fa", bd=0)
         self.txt_log_full.pack(fill="both", expand=True, padx=10, pady=10)
 
+
+    def _build_stats_tab(self, parent):
+        """Bangun tab Hasil & Statistik dengan grafik dan tabel riwayat."""
+        # Inisialisasi data sesi
+        self.session_log = []  # list of dict per deteksi
+
+        top = tk.Frame(parent, bg=BG_PANEL)
+        top.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # ── Kiri: Grafik Bar per Kelas ──
+        left_stats = tk.Frame(top, bg=BG_PANEL)
+        left_stats.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+        ttk.Label(left_stats, text="Distribusi Deteksi per Kelas", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
+
+        self.fig_stats = Figure(figsize=(5, 3), dpi=80)
+        self.ax_stats = self.fig_stats.add_subplot(111)
+        self.fig_stats.tight_layout(pad=1.5)
+        self.canvas_stats = FigureCanvasTkAgg(self.fig_stats, master=left_stats)
+        self.canvas_stats.get_tk_widget().pack(fill="both", expand=True)
+
+        # ── Kanan: Ringkasan Sesi ──
+        right_stats = tk.Frame(top, bg=BG_PANEL, width=220)
+        right_stats.pack(side="right", fill="both", padx=(8, 0))
+
+        ttk.Label(right_stats, text="Ringkasan Sesi", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
+
+        grid_f = tk.Frame(right_stats, bg=BG_PANEL)
+        grid_f.pack(fill="x")
+
+        def _stat_row(label, default="-"):
+            tk.Label(grid_f, text=label, bg=BG_PANEL, font=UI_FONT, fg=TEXT_MUTED, anchor="w").pack(fill="x")
+            lbl = tk.Label(grid_f, text=default, bg=BG_PANEL, font=UI_FONT_BOLD, anchor="w")
+            lbl.pack(fill="x", pady=(0, 2))
+            return lbl
+
+        self.stat_total_det  = _stat_row("Total Deteksi (sesi)")
+        self.stat_max_cov    = _stat_row("Coverage Maks.")
+        self.stat_avg_inf    = _stat_row("Avg. Inference Time")
+        self.stat_top_class  = _stat_row("Kelas Terbanyak")
+        self.stat_kritis_cnt = _stat_row("Kejadian KRITIS")
+        self.stat_waspada_cnt= _stat_row("Kejadian WASPADA")
+
+        # Separator
+        tk.Frame(right_stats, bg=BORDER_COLOR, height=1).pack(fill="x", pady=(12, 0))
+
+        # Tombol Reset
+        ttk.Button(right_stats, text="Reset Data Sesi", style="Red.TButton",
+                   command=self._reset_session_stats).pack(fill="x", pady=(10, 0), ipady=4)
+
+        # ── Bawah: Riwayat Frame ──
+        bot = tk.Frame(parent, bg=BG_PANEL)
+        bot.pack(fill="both", padx=10, pady=(0, 10))
+        ttk.Label(bot, text="Riwayat Deteksi (per sampel)", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
+
+        cols = ("Waktu", "Objek", "Coverage %", "Level", "Inf. Time (ms)", "Patches")
+        self.tv_history = ttk.Treeview(bot, columns=cols, show="headings", height=6)
+        for c in cols:
+            self.tv_history.heading(c, text=c)
+            self.tv_history.column(c, width=110, anchor="center")
+        self.tv_history.column("Waktu", width=75)
+        sb = ttk.Scrollbar(bot, orient="vertical", command=self.tv_history.yview)
+        self.tv_history.configure(yscrollcommand=sb.set)
+        self.tv_history.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        # Tag warna
+        self.tv_history.tag_configure("KRITIS",  background="#fee2e2")
+        self.tv_history.tag_configure("WASPADA", background="#fef9c3")
+        self.tv_history.tag_configure("AMAN",    background="#f0fdf4")
+
+    def _reset_session_stats(self):
+        self.session_log.clear()
+        for item in self.tv_history.get_children():
+            self.tv_history.delete(item)
+        self.ax_stats.clear()
+        self.canvas_stats.draw()
+        for lbl in [self.stat_total_det, self.stat_max_cov, self.stat_avg_inf,
+                    self.stat_top_class, self.stat_kritis_cnt, self.stat_waspada_cnt]:
+            lbl.config(text="-")
+        self.log_activity("Data statistik sesi direset.")
+
+    def _update_stats_tab(self, class_counts, coverage, inf_time, tot_obj, patch_cnt, level):
+        """Dipanggil dari _update_frame_ui untuk update tab statistik."""
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+        self.session_log.append({
+            "time": now_str, "obj": tot_obj, "cov": coverage,
+            "level": level, "inf": inf_time, "patches": patch_cnt,
+            "counts": dict(class_counts)
+        })
+
+        # Insert row ke treeview (max 200 baris)
+        tag = level if level in ("KRITIS", "WASPADA") else "AMAN"
+        self.tv_history.insert("", "end",
+            values=(now_str, tot_obj, f"{coverage:.2f}", level, f"{inf_time:.1f}", patch_cnt),
+            tags=(tag,))
+        if len(self.tv_history.get_children()) > 200:
+            self.tv_history.delete(self.tv_history.get_children()[0])
+        self.tv_history.yview_moveto(1)
+
+        # Update ringkasan
+        total_det = sum(d["obj"] for d in self.session_log)
+        max_cov = max(d["cov"] for d in self.session_log)
+        avg_inf = sum(d["inf"] for d in self.session_log) / len(self.session_log)
+        kritis_cnt = sum(1 for d in self.session_log if d["level"] == "KRITIS")
+        waspada_cnt = sum(1 for d in self.session_log if d["level"] == "WASPADA")
+        all_counts = {}
+        for d in self.session_log:
+            for k, v in d["counts"].items():
+                all_counts[k] = all_counts.get(k, 0) + v
+        top_class = max(all_counts, key=all_counts.get) if all_counts else "-"
+
+        self.stat_total_det.config(text=str(total_det))
+        self.stat_max_cov.config(text=f"{max_cov:.2f} %")
+        self.stat_avg_inf.config(text=f"{avg_inf:.1f} ms")
+        self.stat_top_class.config(text=top_class)
+        self.stat_kritis_cnt.config(text=str(kritis_cnt))
+        self.stat_waspada_cnt.config(text=str(waspada_cnt))
+
+        # Update bar chart (tiap 5 sampel)
+        if len(self.session_log) % 5 == 0 or len(self.session_log) == 1:
+            self.ax_stats.clear()
+            if all_counts:
+                names = list(all_counts.keys())
+                vals  = [all_counts[n] for n in names]
+                colors_map = {
+                    "botol": "#ef4444", "plastik": "#f59e0b", "styrofoam": "#7c3aed",
+                    "organik": "#22c55e", "kertas/karton": "#3b82f6", "lainnya": "#6b7280"
+                }
+                bar_colors = [colors_map.get(n, "#9ca3af") for n in names]
+                bars = self.ax_stats.bar(names, vals, color=bar_colors)
+                for bar, val in zip(bars, vals):
+                    self.ax_stats.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                                       str(val), ha="center", va="bottom", fontsize=8)
+                self.ax_stats.set_ylabel("Jumlah", fontsize=8)
+                self.ax_stats.tick_params(axis="x", labelsize=8, rotation=15)
+                self.ax_stats.tick_params(axis="y", labelsize=8)
+                self.fig_stats.tight_layout(pad=1.2)
+            self.canvas_stats.draw()
+
     def _build_settings_tab(self, parent):
+
         f = tk.Frame(parent, bg=BG_PANEL, padx=20, pady=20)
         f.pack(fill="both", expand=True)
         
@@ -842,7 +993,7 @@ class AdvancedTrashGUI:
                     
         self._show_pil_on_canvas(pil_img)
 
-    def _show_pil_on_canvas(self, pil_img, fps=0, inf_time=0, patch_cnt=0, obj_cnt=0):
+    def _show_pil_on_canvas(self, pil_img, fps=0, inf_time=0, patch_cnt=0, obj_cnt=0, slices=None, x_off=0, y_off=0):
         self._last_pil_img = pil_img.copy()
         canvas = self.canvas_video
         canvas.update_idletasks()
@@ -880,13 +1031,26 @@ class AdvancedTrashGUI:
         draw.rectangle([10, nh-50, 150, nh-10], fill=(0,0,0,150))
         draw.text((15, nh-45), b_txt, fill=(255,255,255,255), font=fnt)
         
+        # SAHI Grid Overlay
+        if getattr(self, 'var_show_sahi', None) and self.var_show_sahi.get() and slices:
+            orig_w, orig_h = pil_img.size
+            for (sx1, sy1, sx2, sy2) in slices:
+                # Koordinat slice di inference_frame -> scale ke nw/nh
+                sx1s = int((sx1 + x_off) * scale)
+                sy1s = int((sy1 + y_off) * scale)
+                sx2s = int((sx2 + x_off) * scale)
+                sy2s = int((sy2 + y_off) * scale)
+                draw.rectangle([sx1s, sy1s, sx2s, sy2s], outline=(80, 200, 255, 180), width=1)
+            # Label
+            draw.text((10, nh - 75), f"SAHI Grid: {len(slices)} tiles", fill=(80, 200, 255, 255), font=fnt)
+
         # Legend bottom right
         draw.rectangle([nw-120, nh-90, nw-10, nh-10], fill=(0,0,0,150))
-        draw.rectangle([nw-110, nh-80, nw-100, nh-70], fill=CLASS_COLORS_RGB[4]) # plastik orange
+        draw.rectangle([nw-110, nh-80, nw-100, nh-70], fill=CLASS_COLORS_RGB[4])
         draw.text((nw-90, nh-82), "plastik", fill=(255,255,255,255), font=fnt)
-        draw.rectangle([nw-110, nh-60, nw-100, nh-50], fill=CLASS_COLORS_RGB[0]) # botol red
+        draw.rectangle([nw-110, nh-60, nw-100, nh-50], fill=CLASS_COLORS_RGB[0])
         draw.text((nw-90, nh-62), "botol", fill=(255,255,255,255), font=fnt)
-        draw.rectangle([nw-110, nh-40, nw-100, nh-30], fill=CLASS_COLORS_RGB[5]) # styrofoam purple
+        draw.rectangle([nw-110, nh-40, nw-100, nh-30], fill=CLASS_COLORS_RGB[5])
         draw.text((nw-90, nh-42), "styrofoam", fill=(255,255,255,255), font=fnt)
 
         tk_img = ImageTk.PhotoImage(pil_r)
@@ -1132,14 +1296,15 @@ class AdvancedTrashGUI:
             else:
                 tot_secs = 0
             
-            # Update UI safely
-            self.root.after(0, self._update_frame_ui, pil_out, fps_display, inf_time, frame_idx, tot_obj, coverage, class_counts, elapsed, tot_secs, patch_cnt)
+            # Update UI safely - teruskan slices untuk overlay SAHI grid
+            vis_slices = slices if use_sahi else None
+            self.root.after(0, self._update_frame_ui, pil_out, fps_display, inf_time, frame_idx, tot_obj, coverage, class_counts, elapsed, tot_secs, patch_cnt, vis_slices, x_offset, y_offset)
             
             # Control Logic
             self._check_alert_logic(coverage, tot_obj)
 
-    def _update_frame_ui(self, pil_out, fps, inf_time, f_idx, tot_obj, coverage, class_counts, elapsed, tot_secs, patch_cnt):
-        self._show_pil_on_canvas(pil_out, fps, inf_time, patch_cnt, tot_obj)
+    def _update_frame_ui(self, pil_out, fps, inf_time, f_idx, tot_obj, coverage, class_counts, elapsed, tot_secs, patch_cnt, slices=None, x_off=0, y_off=0):
+        self._show_pil_on_canvas(pil_out, fps, inf_time, patch_cnt, tot_obj, slices, x_off, y_off)
         
         self.lbl_inf_time.config(text=f"{inf_time:.1f} ms")
         self.lbl_tot_obj.config(text=str(tot_obj))
@@ -1209,6 +1374,15 @@ class AdvancedTrashGUI:
                 self.ax.text(len(self.coverage_history)-1, coverage + 2, f"{coverage:.2f}%", color=ACCENT_BLUE, fontsize=8, ha='center')
                 
             self.canvas_plot.draw()
+
+        # Update tab Hasil & Statistik
+        thr_w = float(self.var_thr_waspada.get())
+        thr_k = float(self.var_thr_kritis.get())
+        if coverage >= thr_k:   level_str = "KRITIS"
+        elif coverage >= thr_w: level_str = "WASPADA"
+        else:                   level_str = "AMAN"
+        if hasattr(self, 'session_log'):
+            self._update_stats_tab(class_counts, coverage, inf_time, tot_obj, patch_cnt, level_str)
 
     # ── Telegram Logic ──
     def _test_telegram(self):
