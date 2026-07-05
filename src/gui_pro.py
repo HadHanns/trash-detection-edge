@@ -15,6 +15,7 @@ import sys
 import time
 import threading
 import argparse
+import json
 from pathlib import Path
 from copy import deepcopy
 import datetime
@@ -24,6 +25,7 @@ from collections import deque
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["POLARS_SKIP_CPU_CHECK"] = "1"
+CONFIG_PATH = ROOT / "config.json"
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -198,6 +200,24 @@ def send_telegram_alert(token, chat_id, message):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
+def send_telegram_photo(token, chat_id, pil_img, caption):
+    """Kirim foto snapshot beserta caption ke Telegram via sendPhoto API."""
+    if not token or not chat_id or pil_img is None: return
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    import io
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=85)
+    buf.seek(0)
+    try:
+        requests.post(
+            url,
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+            files={"photo": ("snapshot.jpg", buf, "image/jpeg")},
+            timeout=15
+        )
+    except Exception as e:
+        print(f"Telegram Photo Error: {e}")
+
 # ── GUI Class ─────────────────────────────────────────────────────────────────
 
 class AdvancedTrashGUI:
@@ -227,6 +247,7 @@ class AdvancedTrashGUI:
         
         self._setup_styles()
         self._build_ui()
+        self._load_config()   # Muat pengaturan tersimpan
         self._start_system_monitor()
         self.log_activity("Aplikasi dimulai.")
         
@@ -383,7 +404,7 @@ class AdvancedTrashGUI:
         self.var_ol_w = _add_combo_param(parent, "Overlap Width (%)", ["10", "20", "30"], 20)
         
         self.var_sahi_enable = tk.BooleanVar(value=True)
-        tk.Checkbutton(parent, text="Auto Slice Resolution", variable=self.var_sahi_enable, bg=BG_PANEL, font=UI_FONT).pack(anchor="w", padx=15, pady=(5,0))
+        tk.Checkbutton(parent, text="Aktifkan Slicing (SAHI)", variable=self.var_sahi_enable, bg=BG_PANEL, font=UI_FONT).pack(anchor="w", padx=15, pady=(5,0))
         
         # ROI
         create_section_header("Region of Interest (ROI)")
@@ -392,13 +413,22 @@ class AdvancedTrashGUI:
         self.btn_roi_draw = ttk.Button(rb_f, text="Buat Polygon ROI", style="Green.TButton", command=self._toggle_roi)
         self.btn_roi_draw.pack(side="left", expand=True, fill="x", padx=(0,2), ipady=3)
         ttk.Button(rb_f, text="Hapus ROI", style="Red.TButton", command=self._clear_roi).pack(side="left", expand=True, fill="x", padx=(2,0), ipady=3)
-        ttk.Button(parent, text="Reset ROI", style="White.TButton", command=self._clear_roi).pack(fill="x", padx=15, pady=(5,0), ipady=2)
         ttk.Label(parent, text="Klik area video (minimal 3 titik)\nuntuk membuat Polygon ROI.", style="Panel.TLabel", foreground=TEXT_MUTED).pack(anchor="w", padx=15, pady=(5,0))
         
         # Parameter Inferensi
         create_section_header("Parameter Inferensi")
+        
+        device_opts = ["cpu"]
+        if torch.cuda.is_available(): device_opts.insert(0, "cuda:0")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available(): device_opts.insert(0, "mps")
+        self.var_device = _add_combo_param(parent, "Hardware Device", device_opts, device_opts[0])
+        
         self.var_conf = _add_combo_param(parent, "Conf. Threshold", ["0.15", "0.25", "0.5"], 0.25)
         self.var_iou = _add_combo_param(parent, "IoU Threshold", ["0.45", "0.5", "0.65"], 0.45)
+        self.var_sample_interval = _add_combo_param(parent, "Sample Interval (dtk)", ["0.5", "1", "2", "3", "5"], 1)
+        
+        self.var_roi_crop = tk.BooleanVar(value=True)
+        tk.Checkbutton(parent, text="Crop ke ROI (percepat deteksi)", variable=self.var_roi_crop, bg=BG_PANEL, font=UI_FONT).pack(anchor="w", padx=15, pady=(5,0))
         
         # Kontrol
         create_section_header("Kontrol Sistem")
@@ -472,8 +502,21 @@ class AdvancedTrashGUI:
         self.var_thr_kritis = tk.StringVar(value="25")
         ttk.Entry(f_thr, textvariable=self.var_thr_kritis, width=5).pack(side="left", padx=5)
         ttk.Label(f_thr, text="%", style="Panel.TLabel").pack(side="left")
-        
-        ttk.Button(f, text="Simpan Pengaturan & Test Kirim", style="Blue.TButton", command=self._test_telegram).pack(anchor="w", pady=10)
+
+        # Cooldown anti-spam
+        ttk.Label(f, text="Jeda Minimum Antar Notifikasi (Anti-Spam):", style="Panel.TLabel").pack(anchor="w", pady=(10, 0))
+        f_cd = tk.Frame(f, bg=BG_PANEL)
+        f_cd.pack(anchor="w", pady=(0,10))
+        self.var_alert_cooldown = tk.StringVar(value="300")
+        ttk.Entry(f_cd, textvariable=self.var_alert_cooldown, width=6).pack(side="left")
+        ttk.Label(f_cd, text=" detik  (300 = 5 menit, 60 = 1 menit)", style="Panel.TLabel").pack(side="left", padx=5)
+
+        # Kirim snapshot
+        self.var_send_snapshot = tk.BooleanVar(value=True)
+        tk.Checkbutton(f, text="Sertakan snapshot/foto saat mengirim alert", variable=self.var_send_snapshot, bg=BG_PANEL, font=UI_FONT).pack(anchor="w", pady=(0,10))
+
+        ttk.Button(f, text="💾 Simpan & Test Kirim", style="Blue.TButton", command=self._test_telegram).pack(anchor="w", pady=10)
+        ttk.Label(f, text="Pengaturan disimpan otomatis saat klik tombol di atas.", style="Panel.TLabel", foreground=TEXT_MUTED).pack(anchor="w")
 
     def _build_right_panel(self, parent_frame):
         # Create scrollable canvas
@@ -604,7 +647,7 @@ class AdvancedTrashGUI:
             self._ec_row_idx += 1
             return lbl
             
-        self.lbl_device = _add_stat_row_grid("Device", f"Local Edge ({DEVICE.upper()})")
+        self.lbl_device = _add_stat_row_grid("Device", "Menunggu...")
         
         def _add_prog_grid(label):
             tk.Label(ec_grid, text=label, bg=BG_PANEL, font=UI_FONT, anchor="w").grid(row=self._ec_row_idx, column=0, sticky="w", pady=3)
@@ -623,7 +666,7 @@ class AdvancedTrashGUI:
         self.lbl_bw = _add_stat_row_grid("Bandwidth (Sim)", "1.25 Mbps")
         
         tk.Label(ec_grid, text="Status", bg=BG_PANEL, font=UI_FONT, anchor="w").grid(row=self._ec_row_idx, column=0, sticky="w", pady=3)
-        self.lbl_ec_status = tk.Label(ec_grid, text="● Running", bg=BG_PANEL, fg=ACCENT_GREEN, font=UI_FONT_BOLD)
+        self.lbl_ec_status = tk.Label(ec_grid, text="● Idle", bg=BG_PANEL, fg=TEXT_MUTED, font=UI_FONT_BOLD)
         self.lbl_ec_status.grid(row=self._ec_row_idx, column=1, sticky="w", pady=3)
         
         log_f = tk.Frame(bottom_right, bg=BG_PANEL)
@@ -640,6 +683,48 @@ class AdvancedTrashGUI:
         self.txt_log_full.insert("end", line)
         self.txt_log_full.see("end")
         print(line.strip())
+
+    def _save_config(self):
+        """Simpan pengaturan Telegram ke config.json."""
+        cfg = {
+            "tg_token":       self.entry_tg_token.get(),
+            "tg_chat_id":     self.entry_tg_chatid.get(),
+            "thr_waspada":    self.var_thr_waspada.get(),
+            "thr_kritis":     self.var_thr_kritis.get(),
+            "alert_cooldown": self.var_alert_cooldown.get(),
+            "send_snapshot":  self.var_send_snapshot.get(),
+        }
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as fp:
+                json.dump(cfg, fp, indent=2)
+            self.log_activity(f"Pengaturan disimpan ke {CONFIG_PATH.name}")
+        except Exception as e:
+            self.log_activity(f"Gagal menyimpan config: {e}")
+
+    def _load_config(self):
+        """Muat pengaturan Telegram dari config.json jika ada."""
+        if not CONFIG_PATH.exists():
+            return
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
+                cfg = json.load(fp)
+            if cfg.get("tg_token"):
+                self.entry_tg_token.delete(0, tk.END)
+                self.entry_tg_token.insert(0, cfg["tg_token"])
+            if cfg.get("tg_chat_id"):
+                self.entry_tg_chatid.delete(0, tk.END)
+                self.entry_tg_chatid.insert(0, cfg["tg_chat_id"])
+            if cfg.get("thr_waspada"):
+                self.var_thr_waspada.set(cfg["thr_waspada"])
+            if cfg.get("thr_kritis"):
+                self.var_thr_kritis.set(cfg["thr_kritis"])
+            if cfg.get("alert_cooldown"):
+                self.var_alert_cooldown.set(cfg["alert_cooldown"])
+            if "send_snapshot" in cfg:
+                self.var_send_snapshot.set(cfg["send_snapshot"])
+            self.log_activity("Pengaturan Telegram dimuat dari config.json")
+        except Exception as e:
+            self.log_activity(f"Gagal memuat config: {e}")
 
     def _start_system_monitor(self):
         def _monitor():
@@ -683,7 +768,9 @@ class AdvancedTrashGUI:
             messagebox.showerror("Error", "Path model tidak ditemukan!")
 
     def _load_model(self):
-        self.log_activity(f"Loading model: {self.model_path} on {DEVICE}...")
+        sel_device = getattr(self, 'var_device', None)
+        dev_str = sel_device.get() if sel_device else DEVICE
+        self.log_activity(f"Loading model: {self.model_path} (Target: {dev_str})...")
         self.model = None
         try:
             self.model = load_yolo_model(self.model_path)
@@ -771,8 +858,12 @@ class AdvancedTrashGUI:
         draw = ImageDraw.Draw(pil_r, "RGBA")
         
         # ROI text top left
+        try:
+            _fnt_roi = ImageFont.truetype("arial.ttf", 16)
+        except:
+            _fnt_roi = ImageFont.load_default()
         if self.roi_points and len(self.roi_points) >= 3:
-            draw.text((10, 10), "ROI (Polygon)", fill=(50,255,50,255), font=ImageFont.truetype("arial.ttf", 16) if os.name=='nt' else ImageFont.load_default())
+            draw.text((10, 10), "ROI (Polygon)", fill=(50,255,50,255), font=_fnt_roi)
             
         # Top right FPS
         fps_text = f"FPS: {fps:.1f} | Inference: {inf_time:.1f} ms"
@@ -862,6 +953,9 @@ class AdvancedTrashGUI:
         self.lbl_ec_status.config(text="● Running", fg=ACCENT_GREEN)
         self.lbl_source.config(text=f"Sumber: {src}")
         
+        sel_dev = self.var_device.get()
+        self.lbl_device.config(text=f"Local Edge ({sel_dev.upper()})")
+        
         if self.var_sahi_enable.get():
             self.lbl_sahi_stat.config(text="SAHI: Active", fg=ACCENT_GREEN)
         else:
@@ -886,19 +980,29 @@ class AdvancedTrashGUI:
     def _process_loop(self):
         cap = self.video_cap
         
-        use_sahi = self.var_sahi_enable.get()
-        sl_h = int(self.var_sl_h.get())
-        sl_w = int(self.var_sl_w.get())
-        ol_h = float(self.var_ol_h.get()) / 100.0
-        ol_w = float(self.var_ol_w.get()) / 100.0
-        conf = float(self.var_conf.get())
-        iou = float(self.var_iou.get())
-        
         start_time = time.time()
+        last_detect_time = 0.0  # Waktu terakhir deteksi dilakukan
+        last_boxes = np.empty((0,4))
+        last_scores = np.empty(0)
+        last_cls_ids = np.empty(0, int)
+        last_class_counts = {}
+        last_coverage = 0.0
+        last_inf_time = 0.0
+        last_patch_cnt = 0
+        frame_counter = 0
         
         while self._running:
             t0 = time.perf_counter()
             ret, frame = cap.read()
+            
+            # Baca parameter dari UI tiap frame (agar perubahan slider langsung berlaku)
+            use_sahi = self.var_sahi_enable.get()
+            sl_h = int(self.var_sl_h.get())
+            sl_w = int(self.var_sl_w.get())
+            ol_h = float(self.var_ol_h.get()) / 100.0
+            ol_w = float(self.var_ol_w.get()) / 100.0
+            conf = float(self.var_conf.get())
+            iou = float(self.var_iou.get())
             
             if not ret:
                 self.root.after(0, self._stop_detection)
@@ -906,16 +1010,54 @@ class AdvancedTrashGUI:
                 
             self.last_frame = frame.copy()
             H, W = frame.shape[:2]
+            frame_counter += 1
+            
+            now = time.perf_counter()
+            sample_interval = float(self.var_sample_interval.get())
+            
+            # Hitung berapa frame yang harus di-skip berdasarkan interval dan FPS video
+            # Jika belum waktunya deteksi, tampilkan frame terakhir dan lanjutkan
+            if (now - last_detect_time) < sample_interval:
+                # Tampilkan frame terkini tanpa menjalankan AI (hemat CPU/GPU)
+                img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_live = Image.fromarray(img_rgb)
+                draw_boxes_pil(pil_live, last_boxes, last_scores, last_cls_ids, self.roi_points)
+                frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if self.total_frames > 0 else frame_counter
+                elapsed = time.time() - start_time
+                tot_secs = (self.total_frames / self.fps_video) if (self.fps_video > 0 and self.total_frames > 0) else 0
+                self.root.after(0, self._update_frame_ui, pil_live, 0, last_inf_time, frame_idx, len(last_boxes), last_coverage, last_class_counts, elapsed, tot_secs, last_patch_cnt)
+                continue
+            
+            # ── Waktunya Deteksi ──
+            last_detect_time = now
+            t0 = time.perf_counter()
             
             patch_cnt = 0
+            
+            # ROI Crop: crop frame ke bounding box ROI sebelum masuk AI
+            use_roi_crop = self.var_roi_crop.get() and len(self.roi_points) >= 3
+            if use_roi_crop:
+                roi_np = np.array(self.roi_points, dtype=np.int32)
+                rx, ry, rw, rh = cv2.boundingRect(roi_np)
+                # Pastikan tidak keluar dari batas frame
+                rx, ry = max(0, rx), max(0, ry)
+                rx2, ry2 = min(W, rx + rw), min(H, ry + rh)
+                inference_frame = frame[ry:ry2, rx:rx2]
+                x_offset, y_offset = rx, ry
+                iH, iW = inference_frame.shape[:2]
+            else:
+                inference_frame = frame
+                x_offset, y_offset = 0, 0
+                iH, iW = H, W
+            
             # Inference
             if use_sahi:
-                slices = generate_slices(H, W, sl_h, sl_w, ol_h, ol_w)
+                slices = generate_slices(iH, iW, sl_h, sl_w, ol_h, ol_w)
                 patch_cnt = len(slices)
                 all_b, all_s, all_c = [], [], []
                 
                 for (x1, y1, x2, y2) in slices:
-                    patch = frame[y1:y2, x1:x2]
+                    patch = inference_frame[y1:y2, x1:x2]
                     ph, pw = patch.shape[:2]
                     if pw != sl_w or ph != sl_h:
                         patch = cv2.resize(patch, (sl_w, sl_h))
@@ -923,11 +1065,12 @@ class AdvancedTrashGUI:
                     else:
                         sx = sy = 1.0
                         
-                    b, s, c = run_yolo_on_patch(self.model, patch, DEVICE, conf, iou)
+                    b, s, c = run_yolo_on_patch(self.model, patch, self.var_device.get(), conf, iou)
                     if len(b) > 0:
                         b = b.copy()
-                        b[:, [0,2]] = np.clip(b[:, [0,2]]*sx + x1, 0, W)
-                        b[:, [1,3]] = np.clip(b[:, [1,3]]*sy + y1, 0, H)
+                        # Map ke koordinat inference_frame, lalu ke frame asli
+                        b[:, [0,2]] = np.clip(b[:, [0,2]]*sx + x1, 0, iW) + x_offset
+                        b[:, [1,3]] = np.clip(b[:, [1,3]]*sy + y1, 0, iH) + y_offset
                         all_b.append(b); all_s.append(s); all_c.append(c)
                         
                 if all_b:
@@ -939,19 +1082,24 @@ class AdvancedTrashGUI:
             else:
                 patch_cnt = 1
                 with torch.no_grad():
-                    res = self.model(frame, conf=conf, iou=iou, device=DEVICE, verbose=False)[0].boxes
-                if res and len(res) > 0:
-                    boxes, scores, cls_ids = res.xyxy.cpu().numpy(), res.conf.cpu().numpy(), res.cls.cpu().numpy().astype(int)
+                    res = self.model(inference_frame, conf=conf, iou=iou, device=self.var_device.get(), verbose=False)[0].boxes
+                if res is not None and len(res) > 0:
+                    boxes = res.xyxy.cpu().numpy()
+                    scores = res.conf.cpu().numpy()
+                    cls_ids = res.cls.cpu().numpy().astype(int)
+                    # Map koordinat balik ke frame asli jika di-crop
+                    if use_roi_crop:
+                        boxes[:, [0,2]] += x_offset
+                        boxes[:, [1,3]] += y_offset
                 else:
                     boxes, scores, cls_ids = np.empty((0,4)), np.empty(0), np.empty(0, int)
                     
-            # ROI Filter
+            # ROI Filter (masih dipakai untuk filter presisi polygon, setelah crop bounding box)
             boxes, scores, cls_ids = filter_boxes_by_roi(boxes, scores, cls_ids, getattr(self, "roi_points", []))
             
             # Stats Calculate
             t1 = time.perf_counter()
             inf_time = (t1 - t0) * 1000
-            fps = 1000.0 / inf_time if inf_time > 0 else 0
             
             coverage = calculate_coverage(boxes, self.roi_points, (H, W))
             tot_obj = len(boxes)
@@ -961,12 +1109,22 @@ class AdvancedTrashGUI:
             for cid in cls_ids:
                 name = GUI_CLASS_MAPPING.get(cid, "obj")
                 class_counts[name] = class_counts.get(name, 0) + 1
+            
+            # Simpan hasil deteksi terakhir untuk frame yang di-skip
+            last_boxes = boxes
+            last_scores = scores
+            last_cls_ids = cls_ids
+            last_class_counts = class_counts
+            last_coverage = coverage
+            last_inf_time = inf_time
+            last_patch_cnt = patch_cnt
                 
             # Visualization
             img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_out = draw_boxes_pil(Image.fromarray(img_rgb), boxes, scores, cls_ids, self.roi_points)
             
-            frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if self.total_frames > 0 else 0
+            fps_display = 1000.0 / inf_time if inf_time > 0 else 0
+            frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if self.total_frames > 0 else frame_counter
             
             elapsed = time.time() - start_time
             if self.fps_video > 0 and self.total_frames > 0:
@@ -975,7 +1133,7 @@ class AdvancedTrashGUI:
                 tot_secs = 0
             
             # Update UI safely
-            self.root.after(0, self._update_frame_ui, pil_out, fps, inf_time, frame_idx, tot_obj, coverage, class_counts, elapsed, tot_secs, patch_cnt)
+            self.root.after(0, self._update_frame_ui, pil_out, fps_display, inf_time, frame_idx, tot_obj, coverage, class_counts, elapsed, tot_secs, patch_cnt)
             
             # Control Logic
             self._check_alert_logic(coverage, tot_obj)
@@ -1060,32 +1218,67 @@ class AdvancedTrashGUI:
             messagebox.showwarning("Warning", "Token dan Chat ID harus diisi!")
             return
         
+        self._save_config()  # Simpan otomatis saat klik tombol
         self.log_activity("Mengirim pesan test ke Telegram...")
-        threading.Thread(target=send_telegram_alert, args=(tok, cid, "✅ <b>Test Notifikasi</b>\nIntegrasi Telegram dengan sistem deteksi sampah berhasil!"), daemon=True).start()
+        snap = getattr(self, '_last_pil_img', None)
+        if self.var_send_snapshot.get() and snap is not None:
+            threading.Thread(
+                target=send_telegram_photo,
+                args=(tok, cid, snap.copy(), "\u2705 <b>Test Notifikasi</b>\nIntegrasi Telegram dengan sistem deteksi sampah berhasil!"),
+                daemon=True
+            ).start()
+        else:
+            threading.Thread(target=send_telegram_alert, args=(tok, cid, "\u2705 <b>Test Notifikasi</b>\nIntegrasi Telegram dengan sistem deteksi sampah berhasil!"), daemon=True).start()
         messagebox.showinfo("Info", "Permintaan kirim ter-trigger. Cek Telegram Anda.")
 
     def _check_alert_logic(self, coverage, obj_count):
         thr_k = float(self.var_thr_kritis.get())
         thr_w = float(self.var_thr_waspada.get())
         
-        level = None
-        if coverage >= thr_k: level = "🚨 KRITIS"
-        elif coverage >= thr_w: level = "⚠️ WASPADA"
+        if coverage >= thr_k:
+            current_level = "KRITIS"
+        elif coverage >= thr_w:
+            current_level = "WASPADA"
+        else:
+            current_level = "AMAN"
+            self.last_alert_level = getattr(self, 'last_alert_level', "AMAN")
+            # Reset cooldown jika turun kembali ke AMAN (agar bisa alert lagi saat naik)
+            if self.last_alert_level != "AMAN":
+                self.last_alert_level = "AMAN"
+            return
         
-        if level:
-            now = time.time()
-            if now - self.last_alert_time > 60:
-                self.last_alert_time = now
-                tok = self.entry_tg_token.get()
-                cid = self.entry_tg_chatid.get()
-                if tok and cid:
-                    msg = (f"{level}\n\n"
-                           f"<b>Sistem Deteksi Sampah</b>\n"
-                           f"Coverage Area: {coverage:.2f}%\n"
-                           f"Total Objek: {obj_count}\n"
-                           f"Waktu: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        now = time.time()
+        cooldown = float(self.var_alert_cooldown.get()) if hasattr(self, 'var_alert_cooldown') else 300.0
+        last_level = getattr(self, 'last_alert_level', "AMAN")
+        
+        # Kirim alert jika: level naik (baru kritis/waspada) ATAU sudah melewati cooldown
+        level_escalated = (current_level == "KRITIS" and last_level != "KRITIS") or \
+                          (current_level == "WASPADA" and last_level == "AMAN")
+        cooldown_passed = (now - self.last_alert_time) > cooldown
+        
+        if level_escalated or cooldown_passed:
+            self.last_alert_time = now
+            self.last_alert_level = current_level
+            tok = self.entry_tg_token.get()
+            cid = self.entry_tg_chatid.get()
+            if tok and cid:
+                emoji = "\U0001f6a8" if current_level == "KRITIS" else "\u26a0\ufe0f"
+                msg = (f"{emoji} <b>{current_level}</b>\n\n"
+                       f"<b>Sistem Deteksi Sampah</b>\n"
+                       f"Coverage Area: {coverage:.2f}%\n"
+                       f"Total Objek: {obj_count}\n"
+                       f"Waktu: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                snap = getattr(self, '_last_pil_img', None)
+                send_snap = getattr(self.var_send_snapshot, 'get', lambda: False)()
+                if send_snap and snap is not None:
+                    threading.Thread(
+                        target=send_telegram_photo,
+                        args=(tok, cid, snap.copy(), msg),
+                        daemon=True
+                    ).start()
+                else:
                     threading.Thread(target=send_telegram_alert, args=(tok, cid, msg), daemon=True).start()
-                    self.log_activity(f"Telegram Alert Sent: {level}")
+                self.log_activity(f"Telegram Alert: {current_level} (coverage {coverage:.1f}%){' + snapshot' if send_snap else ''}")
 
 
 def main():

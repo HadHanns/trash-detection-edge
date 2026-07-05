@@ -37,6 +37,7 @@ logs/
 results/
 preprocess_log.txt
 snapshots/
+config.json
 
 # ── File Sementara / Temporary ─────────────────────────────────────────────────
 *.log
