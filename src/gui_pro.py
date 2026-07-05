@@ -249,6 +249,8 @@ class AdvancedTrashGUI:
         self._build_ui()
         self._load_config()   # Muat pengaturan tersimpan
         self._start_system_monitor()
+        self.tg_last_update_id = 0
+        self._start_telegram_polling()
         self.log_activity("Aplikasi dimulai.")
         
         threading.Thread(target=self._load_model, daemon=True).start()
@@ -888,6 +890,45 @@ class AdvancedTrashGUI:
                     break
                 time.sleep(1)
         threading.Thread(target=_monitor, daemon=True).start()
+
+    def _start_telegram_polling(self):
+        def _poll():
+            while True:
+                try:
+                    # Ambil token aktif saat ini
+                    tok = self.entry_tg_token.get()
+                    if not tok:
+                        time.sleep(5)
+                        continue
+                        
+                    url = f"https://api.telegram.org/bot{tok}/getUpdates"
+                    params = {"timeout": 10, "offset": self.tg_last_update_id}
+                    resp = requests.get(url, params=params, timeout=15)
+                    
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if data.get("ok"):
+                            for update in data.get("result", []):
+                                update_id = update.get("update_id")
+                                self.tg_last_update_id = update_id + 1
+                                
+                                message = update.get("message", {})
+                                text = message.get("text", "").strip()
+                                chat_id = message.get("chat", {}).get("id")
+                                
+                                if text.startswith("/ambilfoto"):
+                                    if getattr(self, '_last_pil_img', None) is not None:
+                                        self.log_activity("Permintaan /ambilfoto dari Telegram diterima.")
+                                        send_telegram_photo(tok, chat_id, self._last_pil_img, "📸 Snapshot manual dari request Telegram.")
+                                    else:
+                                        send_telegram_alert(tok, chat_id, "⚠️ Kamera belum dimulai atau belum ada frame.")
+                except requests.exceptions.RequestException:
+                    time.sleep(5) # Jeda jika tidak ada internet
+                except Exception as e:
+                    print(f"Telegram poll error: {e}")
+                    time.sleep(5)
+                    
+        threading.Thread(target=_poll, daemon=True).start()
 
     def _update_sys_ui(self, cpu, ram):
         self.pb_cpu['value'] = cpu
