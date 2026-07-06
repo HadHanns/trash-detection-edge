@@ -103,17 +103,31 @@ def generate_slices(H, W, size_h=640, size_w=640, overlap_h=0.2, overlap_w=0.2):
     stride_h = int(size_h * (1 - overlap_h))
     stride_w = int(size_w * (1 - overlap_w))
     slices = []
+    
     y = 0
-    while True:
+    while y < H:
+        y1 = y
+        y2 = min(y1 + size_h, H)
+        if y2 == H:
+            y1 = max(0, H - size_h)
+            
         x = 0
-        while True:
-            x1, y1 = x, y
-            x2, y2 = min(x + size_w, W), min(y + size_h, H)
+        while x < W:
+            x1 = x
+            x2 = min(x1 + size_w, W)
+            if x2 == W:
+                x1 = max(0, W - size_w)
+                
             slices.append((x1, y1, x2, y2))
-            if x2 == W: break
+            
+            if x2 == W:
+                break
             x += stride_w
-        if y2 == H: break
+            
+        if y2 == H:
+            break
         y += stride_h
+        
     return slices
 
 def run_yolo_on_patch(model, patch_bgr, device=None, conf=0.25, iou=0.45):
@@ -1207,7 +1221,12 @@ class AdvancedTrashGUI:
                 
                 if current_frame < expected_frame:
                     # AI lambat -> lompat ke frame yang seharusnya agar tetap sinkron dengan waktu nyata
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, expected_frame)
+                    diff = expected_frame - current_frame
+                    if diff > 30:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, expected_frame)
+                    else:
+                        for _ in range(diff):
+                            cap.grab()
                 elif current_frame > expected_frame:
                     # Terlalu cepat (saat skip) -> beri jeda agar video tidak ngebut
                     time.sleep((current_frame - expected_frame) / self.fps_video)
@@ -1281,19 +1300,13 @@ class AdvancedTrashGUI:
                 
                 for (x1, y1, x2, y2) in slices:
                     patch = inference_frame[y1:y2, x1:x2]
-                    ph, pw = patch.shape[:2]
-                    if pw != sl_w or ph != sl_h:
-                        patch = cv2.resize(patch, (sl_w, sl_h))
-                        sx, sy = (x2-x1)/sl_w, (y2-y1)/sl_h
-                    else:
-                        sx = sy = 1.0
                         
                     b, s, c = run_yolo_on_patch(self.model, patch, self.var_device.get(), conf, iou)
                     if len(b) > 0:
                         b = b.copy()
                         # Map ke koordinat inference_frame, lalu ke frame asli
-                        b[:, [0,2]] = np.clip(b[:, [0,2]]*sx + x1, 0, iW) + x_offset
-                        b[:, [1,3]] = np.clip(b[:, [1,3]]*sy + y1, 0, iH) + y_offset
+                        b[:, [0,2]] = np.clip(b[:, [0,2]] + x1, 0, iW) + x_offset
+                        b[:, [1,3]] = np.clip(b[:, [1,3]] + y1, 0, iH) + y_offset
                         all_b.append(b); all_s.append(s); all_c.append(c)
                         
                 if all_b:
