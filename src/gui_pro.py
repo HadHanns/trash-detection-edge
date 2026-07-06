@@ -526,7 +526,7 @@ class AdvancedTrashGUI:
             lbl.pack(fill="x", pady=(0, 2))
             return lbl
 
-        self.stat_total_det  = _stat_row("Total Deteksi (sesi)")
+        self.stat_total_det  = _stat_row("Max Deteksi (Sekaligus)")
         self.stat_max_cov    = _stat_row("Coverage Maks.")
         self.stat_avg_inf    = _stat_row("Avg. Inference Time")
         self.stat_top_class  = _stat_row("Kelas Terbanyak")
@@ -591,15 +591,17 @@ class AdvancedTrashGUI:
         self.tv_history.yview_moveto(1)
 
         # Update ringkasan
-        total_det = sum(d["obj"] for d in self.session_log)
-        max_cov = max(d["cov"] for d in self.session_log)
-        avg_inf = sum(d["inf"] for d in self.session_log) / len(self.session_log)
+        total_det = max(d["obj"] for d in self.session_log) if self.session_log else 0
+        max_cov = max(d["cov"] for d in self.session_log) if self.session_log else 0
+        avg_inf = sum(d["inf"] for d in self.session_log) / len(self.session_log) if self.session_log else 0
         kritis_cnt = sum(1 for d in self.session_log if d["level"] == "KRITIS")
         waspada_cnt = sum(1 for d in self.session_log if d["level"] == "WASPADA")
+        
+        # Untuk grafik bar: ambil nilai maksimum yang terpantau secara bersamaan
         all_counts = {}
         for d in self.session_log:
             for k, v in d["counts"].items():
-                all_counts[k] = all_counts.get(k, 0) + v
+                all_counts[k] = max(all_counts.get(k, 0), v)
         top_class = max(all_counts, key=all_counts.get) if all_counts else "-"
 
         self.stat_total_det.config(text=str(total_det))
@@ -1197,6 +1199,19 @@ class AdvancedTrashGUI:
         frame_counter = 0
         
         while self._running:
+            # -- Sinkronisasi Waktu Nyata (Simulasi UDP Streaming) --
+            if self.total_frames > 0 and self.fps_video > 0:
+                elapsed_real_time = time.time() - start_time
+                current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                expected_frame = int(elapsed_real_time * self.fps_video)
+                
+                if current_frame < expected_frame:
+                    # AI lambat -> lompat ke frame yang seharusnya agar tetap sinkron dengan waktu nyata
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, expected_frame)
+                elif current_frame > expected_frame:
+                    # Terlalu cepat (saat skip) -> beri jeda agar video tidak ngebut
+                    time.sleep((current_frame - expected_frame) / self.fps_video)
+                    
             t0 = time.perf_counter()
             ret, frame = cap.read()
             
@@ -1220,21 +1235,24 @@ class AdvancedTrashGUI:
             now = time.perf_counter()
             sample_interval = float(self.var_sample_interval.get())
             
-            # Hitung berapa frame yang harus di-skip berdasarkan interval dan FPS video
-            # Jika belum waktunya deteksi, tampilkan frame terakhir dan lanjutkan
+            # Hitung apakah harus skip frame ini?
+            # Karena video sudah sinkron dengan real-time (UDP style), kita selalu bisa menggunakan waktu nyata
             if (now - last_detect_time) < sample_interval:
                 # Tampilkan frame terkini tanpa menjalankan AI (hemat CPU/GPU)
                 img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_live = Image.fromarray(img_rgb)
                 draw_boxes_pil(pil_live, last_boxes, last_scores, last_cls_ids, self.roi_points)
                 frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if self.total_frames > 0 else frame_counter
+                
                 elapsed = time.time() - start_time
                 tot_secs = (self.total_frames / self.fps_video) if (self.fps_video > 0 and self.total_frames > 0) else 0
+                
                 self.root.after(0, self._update_frame_ui, pil_live, 0, last_inf_time, frame_idx, len(last_boxes), last_coverage, last_class_counts, elapsed, tot_secs, last_patch_cnt)
                 continue
             
             # ── Waktunya Deteksi ──
             last_detect_time = now
+            self._last_detect_frame = frame_counter
             t0 = time.perf_counter()
             
             patch_cnt = 0
@@ -1332,10 +1350,7 @@ class AdvancedTrashGUI:
             frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if self.total_frames > 0 else frame_counter
             
             elapsed = time.time() - start_time
-            if self.fps_video > 0 and self.total_frames > 0:
-                tot_secs = self.total_frames / self.fps_video
-            else:
-                tot_secs = 0
+            tot_secs = (self.total_frames / self.fps_video) if (self.fps_video > 0 and self.total_frames > 0) else 0
             
             # Update UI safely - teruskan slices untuk overlay SAHI grid
             vis_slices = slices if use_sahi else None
