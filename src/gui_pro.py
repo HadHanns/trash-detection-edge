@@ -50,7 +50,7 @@ DEVICE = _best_device()
 
 # ── Konstanta ─────────────────────────────────────────────────────────────────
 CLASS_NAMES = [
-    "bottle", "grass", "branch", "milk-box", "plastic-bag", "plastic-garbage", "ball", "leaf"
+    "bottle", "grass", "branch", "milk-box", "plastic-bag", "plastic-garbage", "ball", "leaf", "pile"
 ]
 
 CLASS_COLORS_RGB = {
@@ -62,6 +62,7 @@ CLASS_COLORS_RGB = {
     5: (123, 31, 162),   # styrofoam/other plastic (Purple)
     6: (0, 151, 167),    # lainnya (Cyan)
     7: (104, 159, 56),   # organik (Light Green)
+    8: (156, 39, 176),   # tumpukan (Deep Purple)
 }
 
 GUI_CLASS_MAPPING = {
@@ -72,7 +73,8 @@ GUI_CLASS_MAPPING = {
     4: "plastik",
     5: "styrofoam",
     6: "lainnya",
-    7: "organik"
+    7: "organik",
+    8: "tumpukan"
 }
 
 # ── Tema Light ─────────────────────────────────────────────────────────────────
@@ -1102,7 +1104,9 @@ class AdvancedTrashGUI:
             draw.text((10, nh - 75), f"SAHI Grid: {len(slices)} tiles", fill=(80, 200, 255, 255), font=fnt)
 
         # Legend bottom right
-        draw.rectangle([nw-120, nh-90, nw-10, nh-10], fill=(0,0,0,150))
+        draw.rectangle([nw-120, nh-110, nw-10, nh-10], fill=(0,0,0,150))
+        draw.rectangle([nw-110, nh-100, nw-100, nh-90], fill=CLASS_COLORS_RGB[8])
+        draw.text((nw-90, nh-102), "tumpukan", fill=(255,255,255,255), font=fnt)
         draw.rectangle([nw-110, nh-80, nw-100, nh-70], fill=CLASS_COLORS_RGB[4])
         draw.text((nw-90, nh-82), "plastik", fill=(255,255,255,255), font=fnt)
         draw.rectangle([nw-110, nh-60, nw-100, nh-50], fill=CLASS_COLORS_RGB[0])

@@ -1,8 +1,8 @@
 # 🗑️ Trash Detection — YOLO + SAHI + Polygon ROI
 ## Sistem Deteksi Sampah Berbasis Deep Learning | CPU-only Edge Simulation
 
-> **Skripsi** — Deteksi Sampah di Lingkungan Terbuka Menggunakan YOLOv11n & YOLOv8n, SAHI (Slicing Aided Hyper Inference), dan GUI Interaktif  
-> Dataset: **Kaggle RFT Trash Detection (8 Kelas)** | Training: 100 Epoch | Inference: CPU-only
+> **Skripsi** — Deteksi Sampah di Lingkungan Terbuka Menggunakan YOLOv11n & YOLOv8s, SAHI (Slicing Aided Hyper Inference), dan GUI Interaktif  
+> Dataset: **Kaggle RFT Trash Detection (9 Kelas)** | Training: 100 Epoch | Inference: CPU-only
 
 ---
 
@@ -12,8 +12,8 @@ Proyek ini mengimplementasikan sistem deteksi sampah skala kecil (botol, kantong
 
 | Komponen | Detail |
 |----------|--------|
-| **Model** | YOLOv11n & YOLOv8n (Ultralytics ≥ 8.3) |
-| **Dataset** | Kaggle RFT Trash Detection — 8 Kelas |
+| **Model** | YOLOv11n & YOLOv8s (Ultralytics ≥ 8.3) |
+| **Dataset** | Kaggle RFT Trash Detection — 9 Kelas |
 | **Training** | 100 Epoch, Batch 4–8, Imgsz 640, GPU |
 | **SAHI** | Slice 640×640, Overlap 20%, Postprocess: NMS |
 | **Inference** | CPU-only (`torch.device('cpu')`) |
@@ -22,7 +22,7 @@ Proyek ini mengimplementasikan sistem deteksi sampah skala kecil (botol, kantong
 
 ---
 
-## 🏷️ Label Kelas (8 Kelas)
+## 🏷️ Label Kelas (9 Kelas)
 
 | ID | Nama | Keterangan |
 |----|------|------------|
@@ -34,6 +34,7 @@ Proyek ini mengimplementasikan sistem deteksi sampah skala kecil (botol, kantong
 | 5 | `plastic-garbage` | Sampah plastik umum |
 | 6 | `ball` | Bola |
 | 7 | `leaf` | Daun |
+| 8 | `pile` | Tumpukan sampah |
 
 ---
 
@@ -64,14 +65,14 @@ trash-detection-edge/
 │   └── 03_inference_evaluation.ipynb
 ├── weights/
 │   ├── best.pt                  # YOLOv11n — model hasil training 100 epoch
-│   └── best_yolov8n.pt          # YOLOv8n — model hasil training 100 epoch
+│   └── best_yolov8s.pt          # YOLOv8s — model hasil training 100 epoch
 ├── results/
 │   ├── metrics/                 # CSV benchmark results
 │   └── visualizations/          # Output detection images
 ├── tests/
 │   └── test_pipeline.py
 ├── train_final.py               # Script training YOLOv11n
-├── train_yolov8n.py             # Script training YOLOv8n
+├── train_yolov8s.py             # Script training YOLOv8s
 ├── requirements.txt
 └── README.md
 ```
@@ -104,23 +105,23 @@ data/datasets/
 # Training YOLOv11n
 .\miniconda\python.exe train_final.py
 
-# Training YOLOv8n
-.\miniconda\python.exe train_yolov8n.py
+# Training YOLOv8s
+.\miniconda\python.exe train_yolov8s.py
 ```
 
 Model terbaik akan disalin otomatis ke folder `weights/`:
 - `weights/best.pt` — YOLOv11n
-- `weights/best_yolov8n.pt` — YOLOv8n
+- `weights/best_yolov8s.pt` — YOLOv8s
 
 ### 4. Jalankan GUI
 
 ```bash
-# Menggunakan YOLOv8n (default)
+# Menggunakan YOLOv8s (default)
 .\miniconda\python.exe src\gui_pro.py
 
 # Atau pilih model secara manual
 .\miniconda\python.exe src\gui_pro.py --model weights/best.pt           # YOLOv11n
-.\miniconda\python.exe src\gui_pro.py --model weights/best_yolov8n.pt   # YOLOv8n
+.\miniconda\python.exe src\gui_pro.py --model weights/best_yolov8s.pt   # YOLOv8s
 ```
 
 ---
@@ -156,6 +157,12 @@ GUI (`src/gui_pro.py`) menyediakan antarmuka visual lengkap dan canggih untuk de
 | **🖼️ Deteksi Live** | Playback video dengan bounding box. Dilengkapi kontrol **Zoom (⊕/⊖)** dan **Snapshot (📷)** |
 | **⚙️ Pengaturan** | Set Bot Token Telegram, Chat ID, Jeda Notifikasi (Anti-Spam), dan Sertakan Foto Snapshot |
 | **📜 Log** | Histori log aktivitas secara lengkap |
+
+### Fitur Baru (v2.0)
+- **Integrasi Bot Telegram**: Menerima peringatan saat sampah "WASPADA/KRITIS" langsung ke HP Anda. Anda juga bisa mengetik perintah `/ambilfoto` di chat Telegram untuk meminta sistem mengambil *snapshot* kamera saat itu juga.
+- **Simulasi Live Streaming (Sinkronisasi Waktu)**: Pemutaran file video kini dilengkapi logika sinkronisasi *real-time*. Jika AI memproses lambat, video akan otomatis menyesuaikan *frame* (*skip forward*) seperti layaknya streaming langsung, tanpa delay waktu.
+- **Perbaikan Distorsi SAHI**: SAHI kini menggunakan logika *backward shift* untuk kotak di pinggir gambar, sehingga semua kotak akan selalu proporsional dan tidak ada gambar yang mendadak tertarik jadi *gepeng* (distorsi ukuran).
+- **Max vs Sum Aggregation**: Statistik penghitungan objek kini menghitung *jumlah objek maksimum yang muncul secara bersamaan* dalam satu *frame* (`MAX()`), bukan sekadar menjumlahkan deteksi dari tiap frame.
 
 ---
 
@@ -230,13 +237,13 @@ Gambar / Frame Video (resolusi tinggi)
 # 1a. Training YOLOv11n
 .\miniconda\python.exe train_final.py
 
-# 1b. Training YOLOv8n
-.\miniconda\python.exe train_yolov8n.py
+# 1b. Training YOLOv8s
+.\miniconda\python.exe train_yolov8s.py
 
 # 2. Evaluasi model (opsional)
 .\miniconda\python.exe src\benchmark.py --model weights/best.pt --split test --max-images 50
 
-# 3. Demo GUI (YOLOv8n default)
+# 3. Demo GUI (YOLOv8s default)
 .\miniconda\python.exe src\gui_pro.py
 
 # 3b. Demo GUI dengan YOLOv11n
@@ -263,11 +270,11 @@ psutil>=5.9.0        # Resource monitoring
 
 - **YOLOv11 / YOLOv8**: [Ultralytics Docs](https://docs.ultralytics.com/) — YOLO11 & YOLO8 (2023–2024)
 - **SAHI**: [Akyon et al., 2022](https://arxiv.org/abs/2202.06934) — Slicing Aided Hyper Inference and Fine-tuning for Small Object Detection
-- **Dataset**: [Kaggle River Floating Trash Datasets](https://www.kaggle.com/datasets/zhiaun/river-floating-trash-datasets/data) — 8 Kelas Sampah
+- **Dataset**: [Kaggle River Floating Trash Datasets](https://www.kaggle.com/datasets/zhiaun/river-floating-trash-datasets/data) — 9 Kelas Sampah (Ditambah 'Pile')
 
 ---
 
 ## 👤 Penulis
 
 Proyek Skripsi — Sistem Deteksi Sampah Berbasis Deep Learning  
-Model: YOLOv11n & YOLOv8n | Metode: YOLO vs YOLO+SAHI | Interface: GUI Interaktif dengan Polygon ROI
+Model: YOLOv11n & YOLOv8s | Metode: YOLO vs YOLO+SAHI | Interface: GUI Interaktif dengan Polygon ROI

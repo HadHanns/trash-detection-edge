@@ -21,6 +21,7 @@ runs/
 # File model base yang besar (bukan hasil training)
 yolo11n.pt
 yolov8n.pt
+yolov8s.pt
 *.onnx
 *.tflite
 *.engine
