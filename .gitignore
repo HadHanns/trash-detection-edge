@@ -64,3 +64,7 @@ desktop.ini
 
 # ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
+
+eval_output/
+*.csv
+*.log

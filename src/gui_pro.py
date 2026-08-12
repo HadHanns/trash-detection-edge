@@ -249,6 +249,7 @@ class AdvancedTrashGUI:
         self._running = False
         
         self.video_cap = None
+        self._cap_lock = threading.Lock()  # Lock untuk mencegah race condition pada VideoCapture
         self.roi_points = []
         self._is_drawing_roi = False
         self.last_frame = None
@@ -1194,17 +1195,23 @@ class AdvancedTrashGUI:
         threading.Thread(target=self._process_loop, daemon=True).start()
 
     def _stop_detection(self):
+        # Cukup set flag; _process_loop yang akan release VideoCapture setelah loopnya selesai
+        # Ini mencegah race condition libavcodec (pthread_frame.c assertion failed)
         self._running = False
-        if self.video_cap:
-            self.video_cap.release()
         self.btn_start.config(state="normal")
         self.lbl_status.config(text="Status: Stopped", fg=TEXT_MUTED)
         self.lbl_ec_status.config(text="● Stopped", fg=TEXT_MUTED)
         self.log_activity("Deteksi dihentikan.")
 
     def _process_loop(self):
-        cap = self.video_cap
+        # Ambil referensi lokal; jangan akses self.video_cap langsung di dalam loop
+        # untuk menghindari race condition dengan _stop_detection
+        with self._cap_lock:
+            cap = self.video_cap
         
+        if cap is None:
+            return
+
         start_time = time.time()
         last_detect_time = 0.0  # Waktu terakhir deteksi dilakukan
         last_boxes = np.empty((0,4))
@@ -1216,165 +1223,179 @@ class AdvancedTrashGUI:
         last_patch_cnt = 0
         frame_counter = 0
         
-        while self._running:
-            # -- Sinkronisasi Waktu Nyata (Simulasi UDP Streaming) --
-            if self.total_frames > 0 and self.fps_video > 0:
-                elapsed_real_time = time.time() - start_time
-                current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                expected_frame = int(elapsed_real_time * self.fps_video)
-                
-                if current_frame < expected_frame:
-                    # AI lambat -> lompat ke frame yang seharusnya agar tetap sinkron dengan waktu nyata
-                    diff = expected_frame - current_frame
-                    if diff > 30:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, expected_frame)
-                    else:
-                        for _ in range(diff):
-                            cap.grab()
-                elif current_frame > expected_frame:
-                    # Terlalu cepat (saat skip) -> beri jeda agar video tidak ngebut
-                    time.sleep((current_frame - expected_frame) / self.fps_video)
+        try:
+            while self._running:
+                # -- Sinkronisasi Waktu Nyata (Simulasi UDP Streaming) --
+                if self.total_frames > 0 and self.fps_video > 0:
+                    elapsed_real_time = time.time() - start_time
+                    current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                    expected_frame = int(elapsed_real_time * self.fps_video)
                     
-            t0 = time.perf_counter()
-            ret, frame = cap.read()
-            
-            # Baca parameter dari UI tiap frame (agar perubahan slider langsung berlaku)
-            use_sahi = self.var_sahi_enable.get()
-            sl_h = int(self.var_sl_h.get())
-            sl_w = int(self.var_sl_w.get())
-            ol_h = float(self.var_ol_h.get()) / 100.0
-            ol_w = float(self.var_ol_w.get()) / 100.0
-            conf = float(self.var_conf.get())
-            iou = float(self.var_iou.get())
-            
-            if not ret:
-                self.root.after(0, self._stop_detection)
-                break
+                    if current_frame < expected_frame:
+                        # AI lambat -> lompat ke frame yang seharusnya agar tetap sinkron dengan waktu nyata
+                        diff = expected_frame - current_frame
+                        if diff > 30:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, expected_frame)
+                        else:
+                            for _ in range(diff):
+                                if not self._running: break
+                                cap.grab()
+                    elif current_frame > expected_frame:
+                        # Terlalu cepat (saat skip) -> beri jeda agar video tidak ngebut
+                        time.sleep((current_frame - expected_frame) / self.fps_video)
+                        
+                t0 = time.perf_counter()
+                ret, frame = cap.read()
                 
-            self.last_frame = frame.copy()
-            H, W = frame.shape[:2]
-            frame_counter += 1
-            
-            now = time.perf_counter()
-            sample_interval = float(self.var_sample_interval.get())
-            
-            # Hitung apakah harus skip frame ini?
-            # Karena video sudah sinkron dengan real-time (UDP style), kita selalu bisa menggunakan waktu nyata
-            if (now - last_detect_time) < sample_interval:
-                # Tampilkan frame terkini tanpa menjalankan AI (hemat CPU/GPU)
+                # Baca parameter dari UI tiap frame (agar perubahan slider langsung berlaku)
+                use_sahi = self.var_sahi_enable.get()
+                sl_h = int(self.var_sl_h.get())
+                sl_w = int(self.var_sl_w.get())
+                ol_h = float(self.var_ol_h.get()) / 100.0
+                ol_w = float(self.var_ol_w.get()) / 100.0
+                conf = float(self.var_conf.get())
+                iou = float(self.var_iou.get())
+                
+                if not ret:
+                    self.root.after(0, self._stop_detection)
+                    break
+                if not self._running:
+                    break
+                    
+                self.last_frame = frame.copy()
+                H, W = frame.shape[:2]
+                frame_counter += 1
+                
+                now = time.perf_counter()
+                sample_interval = float(self.var_sample_interval.get())
+                
+                # Hitung apakah harus skip frame ini?
+                # Karena video sudah sinkron dengan real-time (UDP style), kita selalu bisa menggunakan waktu nyata
+                if (now - last_detect_time) < sample_interval:
+                    # Tampilkan frame terkini tanpa menjalankan AI (hemat CPU/GPU)
+                    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_live = Image.fromarray(img_rgb)
+                    draw_boxes_pil(pil_live, last_boxes, last_scores, last_cls_ids, self.roi_points)
+                    frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if self.total_frames > 0 else frame_counter
+                    
+                    elapsed = time.time() - start_time
+                    tot_secs = (self.total_frames / self.fps_video) if (self.fps_video > 0 and self.total_frames > 0) else 0
+                    
+                    self.root.after(0, self._update_frame_ui, pil_live, 0, last_inf_time, frame_idx, len(last_boxes), last_coverage, last_class_counts, elapsed, tot_secs, last_patch_cnt)
+                    continue
+                
+                # ── Waktunya Deteksi ──
+                last_detect_time = now
+                self._last_detect_frame = frame_counter
+                t0 = time.perf_counter()
+                
+                patch_cnt = 0
+                
+                # ROI Crop: crop frame ke bounding box ROI sebelum masuk AI
+                use_roi_crop = self.var_roi_crop.get() and len(self.roi_points) >= 3
+                if use_roi_crop:
+                    roi_np = np.array(self.roi_points, dtype=np.int32)
+                    rx, ry, rw, rh = cv2.boundingRect(roi_np)
+                    # Pastikan tidak keluar dari batas frame
+                    rx, ry = max(0, rx), max(0, ry)
+                    rx2, ry2 = min(W, rx + rw), min(H, ry + rh)
+                    inference_frame = frame[ry:ry2, rx:rx2]
+                    x_offset, y_offset = rx, ry
+                    iH, iW = inference_frame.shape[:2]
+                else:
+                    inference_frame = frame
+                    x_offset, y_offset = 0, 0
+                    iH, iW = H, W
+                
+                # Inference
+                if use_sahi:
+                    slices = generate_slices(iH, iW, sl_h, sl_w, ol_h, ol_w)
+                    patch_cnt = len(slices)
+                    all_b, all_s, all_c = [], [], []
+                    
+                    for (x1, y1, x2, y2) in slices:
+                        patch = inference_frame[y1:y2, x1:x2]
+                            
+                        b, s, c = run_yolo_on_patch(self.model, patch, self.var_device.get(), conf, iou)
+                        if len(b) > 0:
+                            b = b.copy()
+                            # Map ke koordinat inference_frame, lalu ke frame asli
+                            b[:, [0,2]] = np.clip(b[:, [0,2]] + x1, 0, iW) + x_offset
+                            b[:, [1,3]] = np.clip(b[:, [1,3]] + y1, 0, iH) + y_offset
+                            all_b.append(b); all_s.append(s); all_c.append(c)
+                            
+                    if all_b:
+                        boxes, scores, cls_ids = multiclass_nms_numpy(
+                            np.concatenate(all_b), np.concatenate(all_s), np.concatenate(all_c), iou
+                        )
+                    else:
+                        boxes, scores, cls_ids = np.empty((0,4)), np.empty(0), np.empty(0, int)
+                else:
+                    patch_cnt = 1
+                    with torch.no_grad():
+                        res = self.model(inference_frame, conf=conf, iou=iou, device=self.var_device.get(), verbose=False)[0].boxes
+                    if res is not None and len(res) > 0:
+                        boxes = res.xyxy.cpu().numpy()
+                        scores = res.conf.cpu().numpy()
+                        cls_ids = res.cls.cpu().numpy().astype(int)
+                        # Map koordinat balik ke frame asli jika di-crop
+                        if use_roi_crop:
+                            boxes[:, [0,2]] += x_offset
+                            boxes[:, [1,3]] += y_offset
+                    else:
+                        boxes, scores, cls_ids = np.empty((0,4)), np.empty(0), np.empty(0, int)
+                        
+                # ROI Filter (masih dipakai untuk filter presisi polygon, setelah crop bounding box)
+                boxes, scores, cls_ids = filter_boxes_by_roi(boxes, scores, cls_ids, getattr(self, "roi_points", []))
+                
+                # Stats Calculate
+                t1 = time.perf_counter()
+                inf_time = (t1 - t0) * 1000
+                
+                coverage = calculate_coverage(boxes, self.roi_points, (H, W))
+                tot_obj = len(boxes)
+                
+                # Generate Table Data
+                class_counts = {}
+                for cid in cls_ids:
+                    name = GUI_CLASS_MAPPING.get(cid, "obj")
+                    class_counts[name] = class_counts.get(name, 0) + 1
+                
+                # Simpan hasil deteksi terakhir untuk frame yang di-skip
+                last_boxes = boxes
+                last_scores = scores
+                last_cls_ids = cls_ids
+                last_class_counts = class_counts
+                last_coverage = coverage
+                last_inf_time = inf_time
+                last_patch_cnt = patch_cnt
+                    
+                # Visualization
                 img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_live = Image.fromarray(img_rgb)
-                draw_boxes_pil(pil_live, last_boxes, last_scores, last_cls_ids, self.roi_points)
+                pil_out = draw_boxes_pil(Image.fromarray(img_rgb), boxes, scores, cls_ids, self.roi_points)
+                
+                fps_display = 1000.0 / inf_time if inf_time > 0 else 0
                 frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if self.total_frames > 0 else frame_counter
                 
                 elapsed = time.time() - start_time
                 tot_secs = (self.total_frames / self.fps_video) if (self.fps_video > 0 and self.total_frames > 0) else 0
                 
-                self.root.after(0, self._update_frame_ui, pil_live, 0, last_inf_time, frame_idx, len(last_boxes), last_coverage, last_class_counts, elapsed, tot_secs, last_patch_cnt)
-                continue
-            
-            # ── Waktunya Deteksi ──
-            last_detect_time = now
-            self._last_detect_frame = frame_counter
-            t0 = time.perf_counter()
-            
-            patch_cnt = 0
-            
-            # ROI Crop: crop frame ke bounding box ROI sebelum masuk AI
-            use_roi_crop = self.var_roi_crop.get() and len(self.roi_points) >= 3
-            if use_roi_crop:
-                roi_np = np.array(self.roi_points, dtype=np.int32)
-                rx, ry, rw, rh = cv2.boundingRect(roi_np)
-                # Pastikan tidak keluar dari batas frame
-                rx, ry = max(0, rx), max(0, ry)
-                rx2, ry2 = min(W, rx + rw), min(H, ry + rh)
-                inference_frame = frame[ry:ry2, rx:rx2]
-                x_offset, y_offset = rx, ry
-                iH, iW = inference_frame.shape[:2]
-            else:
-                inference_frame = frame
-                x_offset, y_offset = 0, 0
-                iH, iW = H, W
-            
-            # Inference
-            if use_sahi:
-                slices = generate_slices(iH, iW, sl_h, sl_w, ol_h, ol_w)
-                patch_cnt = len(slices)
-                all_b, all_s, all_c = [], [], []
+                # Update UI safely - teruskan slices untuk overlay SAHI grid
+                vis_slices = slices if use_sahi else None
+                self.root.after(0, self._update_frame_ui, pil_out, fps_display, inf_time, frame_idx, tot_obj, coverage, class_counts, elapsed, tot_secs, patch_cnt, vis_slices, x_offset, y_offset)
                 
-                for (x1, y1, x2, y2) in slices:
-                    patch = inference_frame[y1:y2, x1:x2]
-                        
-                    b, s, c = run_yolo_on_patch(self.model, patch, self.var_device.get(), conf, iou)
-                    if len(b) > 0:
-                        b = b.copy()
-                        # Map ke koordinat inference_frame, lalu ke frame asli
-                        b[:, [0,2]] = np.clip(b[:, [0,2]] + x1, 0, iW) + x_offset
-                        b[:, [1,3]] = np.clip(b[:, [1,3]] + y1, 0, iH) + y_offset
-                        all_b.append(b); all_s.append(s); all_c.append(c)
-                        
-                if all_b:
-                    boxes, scores, cls_ids = multiclass_nms_numpy(
-                        np.concatenate(all_b), np.concatenate(all_s), np.concatenate(all_c), iou
-                    )
-                else:
-                    boxes, scores, cls_ids = np.empty((0,4)), np.empty(0), np.empty(0, int)
-            else:
-                patch_cnt = 1
-                with torch.no_grad():
-                    res = self.model(inference_frame, conf=conf, iou=iou, device=self.var_device.get(), verbose=False)[0].boxes
-                if res is not None and len(res) > 0:
-                    boxes = res.xyxy.cpu().numpy()
-                    scores = res.conf.cpu().numpy()
-                    cls_ids = res.cls.cpu().numpy().astype(int)
-                    # Map koordinat balik ke frame asli jika di-crop
-                    if use_roi_crop:
-                        boxes[:, [0,2]] += x_offset
-                        boxes[:, [1,3]] += y_offset
-                else:
-                    boxes, scores, cls_ids = np.empty((0,4)), np.empty(0), np.empty(0, int)
-                    
-            # ROI Filter (masih dipakai untuk filter presisi polygon, setelah crop bounding box)
-            boxes, scores, cls_ids = filter_boxes_by_roi(boxes, scores, cls_ids, getattr(self, "roi_points", []))
-            
-            # Stats Calculate
-            t1 = time.perf_counter()
-            inf_time = (t1 - t0) * 1000
-            
-            coverage = calculate_coverage(boxes, self.roi_points, (H, W))
-            tot_obj = len(boxes)
-            
-            # Generate Table Data
-            class_counts = {}
-            for cid in cls_ids:
-                name = GUI_CLASS_MAPPING.get(cid, "obj")
-                class_counts[name] = class_counts.get(name, 0) + 1
-            
-            # Simpan hasil deteksi terakhir untuk frame yang di-skip
-            last_boxes = boxes
-            last_scores = scores
-            last_cls_ids = cls_ids
-            last_class_counts = class_counts
-            last_coverage = coverage
-            last_inf_time = inf_time
-            last_patch_cnt = patch_cnt
-                
-            # Visualization
-            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_out = draw_boxes_pil(Image.fromarray(img_rgb), boxes, scores, cls_ids, self.roi_points)
-            
-            fps_display = 1000.0 / inf_time if inf_time > 0 else 0
-            frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if self.total_frames > 0 else frame_counter
-            
-            elapsed = time.time() - start_time
-            tot_secs = (self.total_frames / self.fps_video) if (self.fps_video > 0 and self.total_frames > 0) else 0
-            
-            # Update UI safely - teruskan slices untuk overlay SAHI grid
-            vis_slices = slices if use_sahi else None
-            self.root.after(0, self._update_frame_ui, pil_out, fps_display, inf_time, frame_idx, tot_obj, coverage, class_counts, elapsed, tot_secs, patch_cnt, vis_slices, x_offset, y_offset)
-            
-            # Control Logic
-            self._check_alert_logic(coverage, tot_obj)
+                # Control Logic
+                self._check_alert_logic(coverage, tot_obj)
+
+        except Exception as e:
+            print(f"[_process_loop] Error tidak terduga: {e}")
+        finally:
+            # Release VideoCapture di sini (bukan di _stop_detection) untuk menghindari
+            # race condition yang menyebabkan "Assertion fctx->async_lock failed" di libavcodec
+            with self._cap_lock:
+                if self.video_cap is not None:
+                    self.video_cap.release()
+                    self.video_cap = None
 
     def _update_frame_ui(self, pil_out, fps, inf_time, f_idx, tot_obj, coverage, class_counts, elapsed, tot_secs, patch_cnt, slices=None, x_off=0, y_off=0):
         self._show_pil_on_canvas(pil_out, fps, inf_time, patch_cnt, tot_obj, slices, x_off, y_off)
